@@ -3,6 +3,7 @@
 app.py
 Carga automática desde Google Sheets (por defecto la URL que diste) y predice Primas y Siniestros
 (Agosto-Diciembre 2025) usando XGBoost/fallback por serie (HOMOLOGACIÓN x TIPO).
+Incluye parser robusto de números y herramienta de diagnóstico.
 """
 import warnings
 warnings.filterwarnings("ignore")
@@ -123,18 +124,83 @@ def try_load_public_sheet(sheet_input: str = None, gid: str = None, timeout: int
 
 # ---------------- Normalization (robust) ----------------
 def parse_number_co(series: pd.Series) -> pd.Series:
-    s = series.astype(str).fillna("")
-    s = s.str.replace(r"[^\d,.\-]", "", regex=True)
-    # remove thousands dots and replace comma decimal with dot
-    # We first remove dots, then replace last comma if present with dot
-    # Simpler: remove dots, replace commas with dots
-    s = s.str.replace(".", "", regex=False).str.replace(",", ".", regex=False)
-    return pd.to_numeric(s, errors='coerce')
+    """
+    Robust parser for Colombian / Latin numeric formats.
+    Rules:
+    - If both '.' and ',' present: assume '.' thousands, ',' decimal -> remove dots and replace comma with dot
+      e.g. "1.234.567,89" -> 1234567.89
+    - If only ',' present:
+      - if digits after last comma == 3 and there is more than one part -> probably thousands separators -> remove commas
+      - else consider comma decimal: replace ',' -> '.'
+    - If only '.' present:
+      - if digits after last dot == 3 and there is more than one part -> thousands separators -> remove dots
+      - else consider dot decimal -> keep
+    - If none present: numeric as-is
+    Fallback: remove non-digits and convert.
+    """
+    import numpy as _np
+    s = series.astype(str).fillna("").str.strip()
+
+    # remove currency symbols/spaces except . , -
+    s = s.str.replace(r"[^\d\-,\.]", "", regex=True)
+
+    def _parse_one(x: str):
+        if x is None:
+            return _np.nan
+        x = str(x).strip()
+        if x == "" or x.lower() in ("nan", "none"):
+            return _np.nan
+        has_dot = "." in x
+        has_comma = "," in x
+        try:
+            if has_dot and has_comma:
+                # ex: "1.234.567,89" or "1,234,567.89"
+                # Heuristic: if last separator is comma -> comma decimal, else if last is dot -> dot decimal
+                if x.rfind(",") > x.rfind("."):
+                    # comma is decimal -> remove dots and replace comma
+                    x2 = x.replace(".", "").replace(",", ".")
+                else:
+                    # dot is decimal -> remove commas
+                    x2 = x.replace(",", "")
+            elif has_comma and not has_dot:
+                parts = x.split(",")
+                if len(parts[-1]) == 3 and len(parts) > 1:
+                    # likely thousands separators -> remove commas
+                    x2 = x.replace(",", "")
+                else:
+                    # decimal
+                    x2 = x.replace(",", ".")
+            elif has_dot and not has_comma:
+                parts = x.split(".")
+                if len(parts[-1]) == 3 and len(parts) > 1:
+                    # dot used as thousands separator
+                    x2 = x.replace(".", "")
+                else:
+                    # dot likely decimal
+                    x2 = x
+            else:
+                x2 = x
+            if x2 in ("", "-", "--"):
+                return _np.nan
+            return float(x2)
+        except Exception:
+            # last resort: strip non digits and convert
+            digits = re.sub(r"[^\d\-\.]", "", x)
+            try:
+                return float(digits) if digits != "" else _np.nan
+            except Exception:
+                return _np.nan
+
+    parsed = s.map(_parse_one)
+    return pd.to_numeric(parsed, errors="coerce")
 
 def normalize_input(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
+    # preserve a copy of the raw columns for diagnosis
+    df_raw_backup = df.copy()
     df.columns = [c.strip() for c in df.columns]
     colmap = {}
+    orig_val_col = None
     for c in df.columns:
         cn = c.strip().lower()
         if 'homolog' in cn:
@@ -155,9 +221,23 @@ def normalize_input(df: pd.DataFrame) -> pd.DataFrame:
             colmap[c] = 'FECHA'
         elif 'valor' in cn:
             colmap[c] = 'VALOR'
+            orig_val_col = c
         elif 'depart' in cn:
             colmap[c] = 'DEPARTAMENTO'
     df = df.rename(columns=colmap)
+
+    # store raw value text if original present
+    if orig_val_col:
+        df['VALOR_RAW'] = df_raw_backup[orig_val_col].astype(str)
+    else:
+        # try common alt names
+        for alt in ['Valor_Mensual','Valor Mensual','VALOR_MENSUAL','valor_mensual','valor mensual']:
+            if alt in df_raw_backup.columns:
+                df['VALOR_RAW'] = df_raw_backup[alt].astype(str)
+                orig_val_col = alt
+                break
+        else:
+            df['VALOR_RAW'] = ""
 
     # Fecha cleaning
     if 'FECHA' in df.columns:
@@ -170,7 +250,7 @@ def normalize_input(df: pd.DataFrame) -> pd.DataFrame:
         df['FECHA'] = pd.NaT
     df['FECHA'] = df['FECHA'].dt.to_period("M").dt.to_timestamp()
 
-    # VALOR numeric
+    # VALOR numeric (use robust parser)
     if 'VALOR' in df.columns:
         df['VALOR'] = parse_number_co(df['VALOR'])
     else:
@@ -189,7 +269,7 @@ def normalize_input(df: pd.DataFrame) -> pd.DataFrame:
         found = False
         for c in df.columns:
             sample = df[c].astype(str).str.lower().head(30).tolist()
-            if any('primas' in s for s in sample) or any('siniest' in s for s in sample):
+            if any('primas' in s for s in sample) or any('siniest' in s for s in sample) or any('siniestro' in s for s in sample):
                 df['TIPO'] = df[c].astype(str).str.strip().str.capitalize()
                 found = True
                 break
@@ -216,7 +296,7 @@ def normalize_input(df: pd.DataFrame) -> pd.DataFrame:
         if not bad.empty:
             st.sidebar.dataframe(bad)
 
-    keep = ['ANIO','FECHA','HOMO','COMPANIA','CIUDAD','RAMO','TIPO','VALOR','DEPARTAMENTO']
+    keep = ['ANIO','FECHA','HOMO','COMPANIA','CIUDAD','RAMO','TIPO','VALOR','VALOR_RAW','DEPARTAMENTO']
     keep = [c for c in keep if c in df.columns]
     return df[keep].dropna(subset=['FECHA']).copy()
 
@@ -341,7 +421,6 @@ if st.sidebar.button("Forzar recarga desde Google Sheets"):
 df_raw = pd.DataFrame()
 load_error = None
 try:
-    # prefer explicit gid if provided, else try extracted one
     extracted_gid = extract_gid(sheet_url) or gid_input or DEFAULT_GID
     df_candidate = try_load_public_sheet(sheet_input=sheet_url, gid=extracted_gid)
     if not df_candidate.empty:
@@ -350,7 +429,6 @@ try:
 except Exception as e:
     load_error = e
     st.sidebar.warning("No se pudo cargar automáticamente la Google Sheet pública. Puedes subir el archivo manualmente.")
-    # show short error in sidebar
     st.sidebar.text(str(e)[:300])
 
 # Manual upload fallback
@@ -376,12 +454,11 @@ if uploaded_xlsx is not None:
 # Option: use sample data
 if df_raw.empty:
     if st.sidebar.button("Usar datos de ejemplo (temporal)"):
-        # generate small sample
         dates = pd.date_range(start='2020-01-01', end='2025-07-01', freq='MS')
         data = []
         comps = ['ESTADO','MAPFRE','LIBERTY']
         ciudades = ['BOGOTA','MEDELLIN','CALI']
-        ramos = ['VIDRIOS','INCENDIO','ROBO']
+        ramos = ['VIDRIOS','INCENDIO','ROBO','SOAT']
         homos = ['GENERALES','ESPECIALES']
         for d in dates:
             for comp in comps:
@@ -414,7 +491,41 @@ except Exception as e:
 st.markdown("### Muestra normalizada (primeras filas)")
 st.dataframe(df.head(6))
 
-# Filters
+# ---------------- DIAGNÓSTICO (útil para tu caso) ----------------
+st.sidebar.markdown("---")
+st.sidebar.markdown("### Diagnóstico de sumas por Ramo/Mes")
+diag_ramo = st.sidebar.text_input("Ramo a inspeccionar", value="SOAT")
+diag_tipo = st.sidebar.selectbox("Tipo", options=["Primas", "Siniestros"], index=0)
+diag_year = st.sidebar.number_input("Año", min_value=2000, max_value=2100, value=2021, step=1)
+diag_month = st.sidebar.selectbox("Mes (num)", options=list(range(1,13)), index=11)
+
+if st.sidebar.button("Ejecutar diagnóstico"):
+    # Use normalized df and raw df to show details
+    df_diag = df.copy()
+    mask_ramo = df_diag['RAMO'].str.upper().str.contains(diag_ramo.upper(), na=False)
+    mask_tipo = df_diag['TIPO'].str.lower() == diag_tipo.lower()
+    mask_fecha = (df_diag['FECHA'].dt.year == int(diag_year)) & (df_diag['FECHA'].dt.month == int(diag_month))
+    sel = df_diag[mask_ramo & mask_tipo & mask_fecha]
+    st.markdown(f"## Diagnóstico: {diag_ramo} · {diag_tipo} · {diag_month:02d}/{diag_year}")
+    st.write(f"Filas encontradas: {len(sel)}")
+    if sel.empty:
+        st.info("No se encontraron filas con esos filtros.")
+    else:
+        # Show raw and parsed values
+        cols_show = ['FECHA','HOMO','COMPANIA','CIUDAD','RAMO','TIPO','VALOR_RAW','VALOR']
+        cols_show = [c for c in cols_show if c in sel.columns]
+        st.dataframe(sel[cols_show].sort_values(by='CIUDAD').head(500))
+        st.write("Suma VALOR (parsed):", sel['VALOR'].sum())
+        st.write("Suma VALOR_RAW (strings) - muestra unicos (hasta 50):")
+        raw_values = sel['VALOR_RAW'].astype(str).unique()[:50].tolist() if 'VALOR_RAW' in sel.columns else []
+        st.write(raw_values)
+        st.write("Filas con VALOR NaN:", int(sel['VALOR'].isna().sum()))
+        # Show sum by city
+        if 'CIUDAD' in sel.columns:
+            st.write("Suma por CIUDAD (parsed):")
+            st.dataframe(sel.groupby('CIUDAD')['VALOR'].sum().sort_values(ascending=False).head(200))
+
+# ---------------- Filters ----------------
 st.sidebar.markdown("---")
 st.sidebar.header("Filtros para predicción")
 company_opts = ["TODAS"] + sorted(df['COMPANIA'].dropna().unique().tolist())
