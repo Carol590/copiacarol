@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+import plotly.express as px
 
 st.set_page_config(page_title="Datos Seguros", layout="wide")
 
@@ -18,10 +19,10 @@ def cargar_datos():
         return pd.DataFrame()
 
 def preparar_datos(df):
-    """Prepara YEAR, MONTH, Valor_Mensual"""
+    """Prepara columnas EXACTAS que necesitas"""
     df.columns = df.columns.str.strip()
     
-    # FECHA
+    # FECHA → YEAR, MONTH
     if 'FECHA' in df.columns:
         df['FECHA'] = pd.to_datetime(df['FECHA'], dayfirst=True, errors='coerce')
         df['YEAR'] = df['FECHA'].dt.year
@@ -33,10 +34,16 @@ def preparar_datos(df):
     # Valor numérico
     if 'Valor_Mensual' in df.columns:
         df['Valor_Mensual'] = pd.to_numeric(df['Valor_Mensual'], errors='coerce').fillna(0)
-    else:
-        df['Valor_Mensual'] = 0
     
-    # Homologación
+    # SEPARAR PRIMAS vs SINIETROS
+    if 'Primas/Siniestros' in df.columns:
+        df['Primas'] = np.where(df['Primas/Siniestros'] == 'Primas', df['Valor_Mensual'], 0)
+        df['Siniestros'] = np.where(df['Primas/Siniestros'] == 'Siniestros', df['Valor_Mensual'], 0)
+    else:
+        df['Primas'] = df['Valor_Mensual']
+        df['Siniestros'] = 0
+    
+    # Homologación (OPCIONAL para filtro)
     if 'HOMOLOGACIÓN' in df.columns:
         df['HOMOLOGACIÓN'] = df['HOMOLOGACIÓN'].astype(str).str.strip()
     else:
@@ -45,8 +52,8 @@ def preparar_datos(df):
     return df.dropna(subset=['YEAR', 'MONTH'])
 
 # === APP ===
-st.title("📊 Promedios por Mes/Año/Homologación")
-st.markdown("**Datos Seguros Colombia 2020-2025**")
+st.title("📊 Primas y Siniestros por Año-Mes")
+st.markdown("**Año | Mes | Promedio Primas | Total Primas | Promedio Siniestros | Total Siniestros**")
 
 # CARGAR Y LIMPIAR
 df = cargar_datos()
@@ -54,7 +61,7 @@ if df.empty:
     st.stop()
 
 df_clean = preparar_datos(df)
-st.success(f"✅ Datos limpios: {len(df_clean):,} filas")
+st.success(f"✅ Datos listos: {len(df_clean):,} filas")
 
 # Sidebar filtros
 st.sidebar.header("🔍 Filtros")
@@ -67,65 +74,99 @@ homologacion = st.sidebar.multiselect(
 
 df_filt = df_clean[df_clean['HOMOLOGACIÓN'].isin(homologacion)].copy()
 
-# === 1. PROMEDIOS POR MES/AÑO/HOMOLOGACIÓN ===
-st.header("📈 Promedios Mensuales por Homologación")
+# === TABLA EXACTA QUE PIDES ===
+st.header("📈 Tabla: Año | Mes | Prom_Prim | Tot_Prim | Prom_Sin | Tot_Sin")
 
-# Agrupar: PROMEDIO por YEAR, MONTH, HOMOLOGACIÓN
-promedios = df_filt.groupby(['YEAR', 'MONTH', 'HOMOLOGACIÓN'])['Valor_Mensual'].agg(['mean', 'sum', 'count']).round(0)
-promedios.columns = ['Promedio', 'Total', 'N_Filas']
-promedios = promedios.reset_index()
-promedios['Mes_Año'] = promedios['YEAR'].astype(str) + '-' + promedios['MONTH'].astype(str).str.zfill(2)
+# AGRUPAR por YEAR, MONTH → LAS 6 COLUMNAS EXACTAS
+tabla = df_filt.groupby(['YEAR', 'MONTH']).agg({
+    'Primas': ['mean', 'sum'],
+    'Siniestros': ['mean', 'sum']
+}).round(0)
 
-st.dataframe(promedios, use_container_width=True)
+# RENOMBRAR EXACTAMENTE como pides
+tabla.columns = [
+    'Promedio_Primas', 'Total_Primas', 
+    'Promedio_Siniestros', 'Total_Siniestros'
+]
+tabla = tabla.reset_index()
 
-# === 2. GRÁFICO PROMEDIOS ===
-import plotly.express as px
-fig = px.line(
-    promedios, 
-    x='Mes_Año', 
-    y='Promedio',
-    color='HOMOLOGACIÓN',
-    title="📊 Promedio Mensual por Homologación",
-    markers=True
+# ORDENAR por AÑO y MES
+tabla = tabla.sort_values(['YEAR', 'MONTH'])
+
+st.dataframe(tabla, use_container_width=True, height=600)
+
+# === GRÁFICO ===
+fig_line = px.line(
+    tabla, 
+    x='MONTH', 
+    y=['Promedio_Primas', 'Promedio_Siniestros'],
+    color_discrete_sequence=['#1f77b4', '#ff7f0e'],
+    facet_col='YEAR',
+    facet_col_wrap=4,
+    title="📊 Promedio Mensual Primas vs Siniestros (por Año)",
+    labels={'value': 'Promedio ($)', 'MONTH': 'Mes'}
 )
-fig.update_layout(xaxis_tickangle=-45, height=500)
-st.plotly_chart(fig, use_container_width=True)
+fig_line.update_traces(line_shape="linear")
+st.plotly_chart(fig_line, use_container_width=True)
 
-# === 3. RESUMEN POR HOMOLOGACIÓN ===
-st.header("🏢 Resumen por Homologación")
+# === GRÁFICO TOTALES ===
+fig_bar = px.bar(
+    tabla, 
+    x='MONTH', 
+    y=['Total_Primas', 'Total_Siniestros'],
+    color_discrete_sequence=['#2ca02c', '#d62728'],
+    facet_col='YEAR',
+    facet_col_wrap=4,
+    title="💰 Total Mensual Primas vs Siniestros (por Año)",
+    labels={'value': 'Total ($)', 'MONTH': 'Mes'}
+)
+st.plotly_chart(fig_bar, use_container_width=True)
 
-resumen_homo = df_filt.groupby('HOMOLOGACIÓN')['Valor_Mensual'].agg([
-    'count', 'mean', 'sum', 'std'
-]).round(0)
-resumen_homo.columns = ['N_Filas', 'Promedio', 'Total', 'Desviación']
-resumen_homo = resumen_homo.sort_values('Total', ascending=False)
-st.dataframe(resumen_homo, use_container_width=True)
+# === RESUMEN ANUAL ===
+st.header("📅 Resumen Anual")
+resumen_anual = df_filt.groupby('YEAR').agg({
+    'Primas': ['mean', 'sum'],
+    'Siniestros': ['mean', 'sum']
+}).round(0)
 
-# Métricas principales
+resumen_anual.columns = [
+    'Promedio_Primas', 'Total_Primas', 
+    'Promedio_Siniestros', 'Total_Siniestros'
+]
+resumen_anual = resumen_anual.reset_index()
+
 col1, col2, col3, col4 = st.columns(4)
-total_general = df_filt['Valor_Mensual'].sum()
-col1.metric("💰 Total General", f"${total_general:,.0f}")
-col2.metric("📊 Promedio", f"${df_filt['Valor_Mensual'].mean():,.0f}")
-col3.metric("📈 Homologaciones", len(df_filt['HOMOLOGACIÓN'].unique()))
-col4.metric("📅 Años", f"{df_filt['YEAR'].min()}-{df_filt['YEAR'].max()}")
+col1.metric("💰 Total Primas", f"${resumen_anual['Total_Primas'].sum():,.0f}")
+col2.metric("💰 Total Siniestros", f"${resumen_anual['Total_Siniestros'].sum():,.0f}")
+col3.metric("📊 Promedio Primas", f"${resumen_anual['Promedio_Primas'].mean():,.0f}")
+col4.metric("📊 Promedio Siniestros", f"${resumen_anual['Promedio_Siniestros'].mean():,.0f}")
 
-# === 4. TOP 10 MESES MÁS ALTOS ===
-st.header("🔥 Top 10 Meses (Total)")
-top_meses = promedios.nlargest(10, 'Total')[['Mes_Año', 'HOMOLOGACIÓN', 'Total', 'Promedio']]
+st.dataframe(resumen_anual, use_container_width=True)
+
+# === TOP MESES ===
+st.header("🔥 Top 10 Meses (Total Primas + Siniestros)")
+tabla['Total_General'] = tabla['Total_Primas'] + tabla['Total_Siniestros']
+top_meses = tabla.nlargest(10, 'Total_General')[
+    ['YEAR', 'MONTH', 'Total_Primas', 'Total_Siniestros', 'Total_General']
+]
 st.dataframe(top_meses, use_container_width=True)
 
-# === 5. TABLA COMPLETA FILTRADA ===
-with st.expander("📋 Ver TODOS los datos filtrados"):
-    st.dataframe(df_filt[['YEAR', 'MONTH', 'HOMOLOGACIÓN', 'Valor_Mensual']].sort_values('YEAR'), height=400)
-
 # === DESCARGA ===
-csv = df_filt.to_csv(index=False).encode('utf-8')
+csv = tabla.to_csv(index=False).encode('utf-8')
 st.download_button(
-    label="📥 Descargar CSV filtrado",
+    label="📥 Descargar TABLA (Año|Mes|Prim|Sini)",
     data=csv,
-    file_name=f"seguros_{pd.Timestamp.now().strftime('%Y%m%d')}.csv",
+    file_name=f"tabla_primas_siniestros_{pd.Timestamp.now().strftime('%Y%m%d')}.csv",
     mime='text/csv'
 )
 
+# Vista datos originales
+with st.expander("🔎 Datos originales"):
+    st.dataframe(
+        df_filt[['YEAR', 'MONTH', 'HOMOLOGACIÓN', 'Primas/Siniestros', 'Primas', 'Siniestros']]
+        .head(1000), 
+        height=400
+    )
+
 st.markdown("---")
-st.caption("✅ Paso 2 completado | Siguiente: Modelos XGBoost")
+st.caption("✅ TABLA EXACTA: Año | Mes | Prom_Primas | Total_Primas | Prom_Siniestros | Total_Siniestros")
