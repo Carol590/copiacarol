@@ -1,59 +1,76 @@
-# Predicción de Primas y Siniestros — app.py
+```markdown
+# Predicción de Primas y Siniestros — Streamlit + XGBoost
 
-Este repositorio contiene una aplicación Streamlit (app.py) diseñada para predecir las primas y los siniestros del mercado asegurador colombiano usando XGBoost (o un fallback si XGBoost no está disponible). La app crea pronósticos mensuales para los meses de agosto a diciembre de 2025 y presenta tres páginas con filtros por compañía, ciudad y ramo.
+Esta aplicación (app.py) carga los datos desde la Google Sheet que indiques y genera predicciones de primas y siniestros para Agosto-Diciembre 2025 (5 meses) usando XGBoost (o un regresor de fallback si XGBoost no está disponible).
 
-## Estructura de archivos
-- `app.py` — aplicación Streamlit principal.
+Contenido
+- `app.py` — aplicación Streamlit principal (carga desde Google Sheet pública / service account / CSV).
 - `requirements.txt` — dependencias necesarias.
-- `README.md` — (este archivo) instrucciones y notas.
 
-## Formato esperado del dataset (CSV)
-La app espera un CSV con las siguientes columnas (nombres exactos no son case-sensitive, pero se recomiendan tal como aparecen):
+Uso rápido
+1. Crear entorno virtual (opcional)
+   python -m venv .venv
+   source .venv/bin/activate  # Linux/macOS
+   .venv\Scripts\activate     # Windows
 
-- HOMOLOGACIÓN — (ej. comuna / segmento) (string)
-- Año — año (int) — opcional si FECHA existe
-- COMPAÑÍA — compañía aseguradora (string)
-- CIUDAD — ciudad (string)
-- RAMOS — ramo / línea (string)
-- Primas/Siniestros — categoría: "Primas" o "Siniestros" (string)
-- FECHA — fecha con formato dd/mm/YYYY (ej. `31/08/2022 12:00:00 a. m.`) o cualquier parseable; se convertirá a comienzo de mes
-- Valor_Mensual — valor numérico mensual (int/float)
-- DEPARTAMENTO — departamento (string)
+2. Instalar dependencias
+   pip install -r requirements.txt
 
-Ejemplo de filas:
-GENERALES,2022,ALFA,BUENAVENTURA,VIDRIOS,Primas,31/08/2022 12:00:00 a. m.,0,VALLE DEL CAUCA
+3. Ejecutar Streamlit
+   streamlit run app.py
 
-## Qué hace la app
-- Limpia y normaliza fechas y valores.
-- Permite filtrar por COMPAÑÍA, CIUDAD y RAMOS (Ramo).
-- Entrena un modelo XGBoost por serie temporal (por HOMOLOGACIÓN y por variable Primas/Siniestros) cuando hay datos suficientes; si no, usa un promedio heurístico.
-- Predice mensual (iterativo) de agosto a diciembre de 2025 (5 meses).
-- Presenta:
-  - Página 1: Gráfico histórico consolidado de Primas y Siniestros + tabla por HOMOLOGACIÓN con columnas de predicción.
-  - Página 2: Mis ciudades objetivo (BOGOTA, MEDELLIN, CALI, BUCARAMANGA, BARRANQUILLA, CARTAGENA, TUNJA) — gráficos y tablas.
-  - Página 3: Competidores (ESTADO, MAPFRE GENERALES, LIBERTY, AXA GENERALES, MUNDIAL, PREVISORA) — análisis similar.
+Cómo conectar la Google Sheet
+- Opción A (pública): en la sidebar elige "Google Sheet pública" y pega la URL completa o el Sheet ID. La app intentará cargar automáticamente (export CSV / gviz / pub CSV).
+- Opción B (service account, para hojas privadas): en la sidebar elige "Google Sheet (service account)". Guarda el JSON de la service account en `st.secrets["gcp_service_account"]` (recomendado) o súbelo en la interfaz. Además, comparte la hoja con el e-mail del service account con permiso de lectura.
+  - Ejemplo en `secrets.toml` para Streamlit Cloud:
+    ```
+    [gcp_service_account]
+    type = "service_account"
+    project_id = "your-project-id"
+    private_key_id = "..."
+    private_key = "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
+    client_email = "xxxx@xxxx.iam.gserviceaccount.com"
+    client_id = "..."
+    ...
+    ```
+  - Alternativamente puedes definir la variable de entorno `GCP_SERVICE_ACCOUNT_JSON` con el JSON serializado.
+
+Formato esperado del dataset (si subes CSV)
+- Columnas manejadas (la app intenta normalizar variantes):
+  - HOMOLOGACIÓN
+  - Año (opcional)
+  - COMPAÑÍA
+  - CIUDAD
+  - RAMOS
+  - Primas/Siniestros (valores: "Primas" o "Siniestros")
+  - FECHA (ej. `31/08/2022 12:00:00 a. m.` — la app normaliza al primer día del mes)
+  - Valor_Mensual
+  - DEPARTAMENTO
+
+Qué hace la app
+- Limpia y normaliza los datos.
+- Entrena un modelo por serie (HOMOLOGACIÓN × Primas/Siniestros) usando XGBoost (o fallback).
+- Predice los meses Agosto a Diciembre de 2025.
+- Presenta 3 páginas:
+  1. Resumen por HOMOLOGACIÓN (tabla con predicciones).
+  2. Ciudades objetivo (BOGOTA, MEDELLIN, CALI, BUCARAMANGA, BARRANQUILLA, CARTAGENA, TUNJA).
+  3. Competidores (ESTADO, MAPFRE GENERALES, LIBERTY, AXA GENERALES, MUNDIAL, PREVISORA).
 - Permite descargar las predicciones en Excel.
 
-## Cómo ejecutar
-1. Crea un entorno virtual e instala dependencias:
-   pip install -r requirements.txt
-2. Ejecuta:
-   streamlit run app.py
-3. En la barra lateral sube tu CSV o utiliza la muestra (si proporcionada).
+Notas y recomendaciones
+- Si la Google Sheet no carga con la opción pública, prueba:
+  - Abrir en el navegador: https://docs.google.com/spreadsheets/d/<SHEET_ID>/export?format=csv&gid=<GID>
+  - Hacer "Archivo → Publicar en la web" y usar la URL de `pub?output=csv`
+  - Usar la opción service account si prefieres mantener la hoja privada.
+- Para mejorar la calidad de predicción se recomienda:
+  - Más datos históricos por serie (ideal >= 24 meses)
+  - Ingenierías de features adicionales (festivos, variables macro)
+  - Validación temporal y métricas (SMAPE, MAPE, etc.)
 
-## Notas y limitaciones
-- La calidad de las predicciones depende de la cantidad y calidad histórica por serie. Para series con menos de 12 meses de datos la app usa un promedio móvil como fallback.
-- XGBoost se usa por defecto. Si XGBoost no está instalado, la app usa un regresor de scikit-learn (HistGradientBoostingRegressor).
-- El pipeline es simple y pensado para prototipado rápido. Para producción se recomiendan pasos adicionales:
-  - Feature engineering más exhaustivo (festivos, variables macro, IPC real).
-  - Validación temporal robusta y calibración de intervalos de confianza.
-  - Guardado y monitorización de modelos.
+Si quieres que:
+- añada intervalos de confianza,
+- permita guardar modelos entrenados,
+- o empaquete la app para despliegue en Streamlit Cloud con secrets configurados,
+dímelo y lo preparo.
+```
 
-Si necesitas que adapte la app para calcular intervalos de confianza o exportar modelos serializados, dímelo y lo añadimos.
-## Despliegue
-[Insertar badge de Streamlit aquí]
-
-## Instalación Local
-```bash
-pip install -r requirements.txt
-streamlit run app.py
