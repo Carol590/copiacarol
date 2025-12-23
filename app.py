@@ -1,402 +1,532 @@
 # -*- coding: utf-8 -*-
 """
-Streamlit app: Industria — Nowcast & Forecast por Ciudad/Ramo (incluye proyección mes a mes 2026)
-- Carga automáticamente la Hoja1 del spreadsheet (ID/GID definidos) usando la URL de export CSV.
-- Si la hoja no es pública la app mostrará instrucciones (no hace upload).
-- Normaliza columnas mínimas (FECHA, VALOR, TIPO_VALOR, CIUDAD, RAMO, COMPANIA, ESTADO, etc).
-- Forecast por ciudad o por ramo (configurable). Calcula:
-    * Nowcast / cierre estimado del año seleccionado por ciudad/ramo
-    * Proyección mes-a-mes para 2026 por ciudad/ramo (y total industria)
-    * Comparativa "Solo ESTADO" (mi empresa) vs Industria
-- Descarga Excel con resultados.
+app.py
+Carga automática desde Google Sheets (por defecto la URL que diste) y predice Primas y Siniestros
+(Agosto-Diciembre 2025) usando XGBoost/fallback por serie (HOMOLOGACIÓN x TIPO).
 """
-
 import warnings
 warnings.filterwarnings("ignore")
+
+import re
+from io import BytesIO, StringIO
+from urllib.parse import quote, urlparse, parse_qs
+import requests
+import os
+import json
 
 import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from datetime import datetime
-from io import BytesIO
-from typing import Optional, Dict, List
 
-# Time series models
-from statsmodels.tsa.statespace.sarimax import SARIMAX
-from statsmodels.tsa.arima.model import ARIMA
+# ML libs
+try:
+    from xgboost import XGBRegressor
+    XGBOOST_AVAILABLE = True
+except Exception:
+    XGBOOST_AVAILABLE = False
 
-# ---------- Config ----------
-DEFAULT_SHEET_ID = "1VljNnZtRPDA3TkTUP6w8AviZCPIfIlqe"
+from sklearn.ensemble import HistGradientBoostingRegressor
+
+# ---------------- Config (DEFAULT sheet links you provided) ----------------
+DEFAULT_SHEET_URL_1 = "https://docs.google.com/spreadsheets/d/1VljNnZtRPDA3TkTUP6w8AviZCPIfILqe/edit?usp=sharing&ouid=112431990130910944357&rtpof=true&sd=true"
+DEFAULT_SHEET_URL_2 = "https://docs.google.com/spreadsheets/d/1VljNnZtRPDA3TkTUP6w8AviZCPIfILqe/edit?gid=293107109#gid=293107109"
+DEFAULT_SHEET_ID = "1VljNnZtRPDA3TkTUP6w8AviZCPIfILqe"
 DEFAULT_GID = "293107109"
 
-st.set_page_config(page_title="Industria · Forecast 2026 por Ciudad / Ramo", layout="wide")
+TARGET_START = pd.Timestamp("2025-08-01")
+TARGET_MONTHS = pd.date_range(start=TARGET_START, periods=5, freq="MS")  # Aug-Dec 2025
+TARGET_MONTHS_STR = [d.strftime("%b-%Y") for d in TARGET_MONTHS]
 
-# ---------- Utilities ----------
-def export_csv_url(sheet_id: str, gid: str) -> str:
-    """Genera URL de exportación correcta (SIN espacios)"""
-    return f"https://docs.google.com/spreadsheets/d/1VljNnZtRPDA3TkTUP6w8AviZCPIfILqe/edit?gid=293107109#gid=293107109"
+st.set_page_config(page_title="Primas & Siniestros — Forecast XGB", layout="wide")
 
+# ---------------- Helpers: sheet id / gid extraction and loading ----------------
+def extract_sheet_id(url_or_id: str) -> str:
+    if not isinstance(url_or_id, str):
+        return ""
+    s = url_or_id.strip()
+    # if already looks like id
+    if re.fullmatch(r"[A-Za-z0-9_\-]{10,}", s):
+        return s
+    m = re.search(r"/d/([a-zA-Z0-9-_]+)", s)
+    if m:
+        return m.group(1)
+    # fallback: query param id=
+    parsed = urlparse(s)
+    qs = parse_qs(parsed.query)
+    if 'id' in qs:
+        return qs['id'][0]
+    return s
+
+def extract_gid(url: str) -> str:
+    if not isinstance(url, str):
+        return ""
+    m = re.search(r"[?&]gid=(\d+)", url)
+    if m:
+        return m.group(1)
+    m2 = re.search(r"/edit#gid=(\d+)", url)
+    if m2:
+        return m2.group(1)
+    return ""
+
+def export_csv_url(sheet_id: str, gid: str = "0") -> str:
+    return f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
+
+def try_load_public_sheet(sheet_input: str = None, gid: str = None, timeout: int = 20):
+    """
+    Try multiple public endpoints (export by gid, gviz by sheet name, pub output).
+    Returns DataFrame or raises RuntimeError with details.
+    """
+    if not sheet_input:
+        raise RuntimeError("No sheet_input provided.")
+    sheet_id = extract_sheet_id(sheet_input)
+    if not sheet_id:
+        raise RuntimeError("No sheet id could be extracted.")
+
+    tried = []
+    errors = []
+    gid_use = gid if gid and gid.strip() else "0"
+    candidates = [
+        export_csv_url(sheet_id, gid_use),
+        export_csv_url(sheet_id, "0"),
+        f"https://docs.google.com/spreadsheets/d/{sheet_id}/pub?output=csv",
+        f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv"
+    ]
+
+    last_status = None
+    for url in candidates:
+        tried.append(url)
+        try:
+            resp = requests.get(url, timeout=timeout)
+            last_status = resp.status_code
+            if resp.status_code == 200:
+                text = resp.text
+                # quick sanity check: lots of commas/newlines
+                if ("," in text) and ("\n" in text):
+                    try:
+                        df = pd.read_csv(StringIO(text))
+                        return df
+                    except Exception as e:
+                        errors.append((url, f"200 OK but CSV parse failed: {e}"))
+                        continue
+                else:
+                    errors.append((url, f"200 OK but content not CSV-like (len {len(text)})"))
+            else:
+                errors.append((url, f"HTTP {resp.status_code}"))
+        except Exception as e:
+            errors.append((url, f"Exception: {type(e).__name__}: {e}"))
+            continue
+
+    msg = "Could not load public sheet. Tried:\n" + "\n".join([f"- {u}" for u in tried]) + "\nErrors:\n" + "\n".join([f"- {u} -> {e}" for u, e in errors])
+    raise RuntimeError(msg + f"\nLast status: {last_status}")
+
+# ---------------- Normalization (robust) ----------------
 def parse_number_co(series: pd.Series) -> pd.Series:
     s = series.astype(str).fillna("")
     s = s.str.replace(r"[^\d,.\-]", "", regex=True)
+    # remove thousands dots and replace comma decimal with dot
+    # We first remove dots, then replace last comma if present with dot
+    # Simpler: remove dots, replace commas with dots
     s = s.str.replace(".", "", regex=False).str.replace(",", ".", regex=False)
-    return pd.to_numeric(s, errors="coerce")
+    return pd.to_numeric(s, errors='coerce')
 
-def ensure_monthly(ts: pd.Series) -> pd.Series:
-    ts = ts.asfreq("MS")
-    ts = ts.interpolate(method="linear", limit_area="inside")
-    return ts
-
-def smape(y_true, y_pred):
-    y_true = np.array(y_true, dtype=float)
-    y_pred = np.array(y_pred, dtype=float)
-    return np.mean(2.0 * np.abs(y_pred - y_true) / (np.abs(y_true) + np.abs(y_pred) + 1e-9)) * 100
-
-def sanitize_trailing_zeros(ts: pd.Series, ref_year: int) -> pd.Series:
-    ts = ensure_monthly(ts.copy())
-    year_series = ts[ts.index.year == ref_year]
-    if year_series.empty:
-        return ts.dropna()
-    mask = (year_series[::-1] == 0)
-    run, flag = [], True
-    for v in mask:
-        if flag and bool(v):
-            run.append(True)
-        else:
-            flag = False
-            run.append(False)
-    trailing_zeros = pd.Series(run[::-1], index=year_series.index)
-    ts.loc[trailing_zeros.index[trailing_zeros]] = np.nan
-    if ts.last_valid_index() is not None:
-        ts = ts.loc[:ts.last_valid_index()]
-    return ts.dropna()
-
-def split_series_excluding_partial_current(ts: pd.Series, ref_year: int, today_like: pd.Timestamp):
-    ts = ensure_monthly(ts.copy())
-    cur_m = pd.Timestamp(year=today_like.year, month=today_like.month, day=1)
-    if len(ts) == 0:
-        return ts, None, False
-    end_of_month = (cur_m + pd.offsets.MonthEnd(0)).day
-    if today_like.day < end_of_month:
-        ts.loc[cur_m] = np.nan
-        return ts.dropna(), cur_m, True
-    return ts.dropna(), None, False
-
-def fmt_cop(x):
-    try:
-        if pd.isna(x):
-            return "-"
-    except Exception:
-        return "-"
-    try:
-        return "$" + f"{int(round(float(x))):,}".replace(",", ".")
-    except Exception:
-        return x
-
-# ---------- Forecast helper ----------
-def fit_forecast(ts_m: pd.Series, steps: int, eval_months:int=6, conservative_factor: float = 1.0):
-    """Forecast historical series ts_m and return hist_df, fc_df, smape_last"""
-    if steps < 1:
-        steps = 1
-    ts = ensure_monthly(ts_m.copy())
-    if ts.empty:
-        return pd.DataFrame(columns=["FECHA","Mensual","ACUM"]), pd.DataFrame(columns=["FECHA","Forecast_mensual","Forecast_acum","IC_lo","IC_hi"]), np.nan
-    y = np.log1p(ts.replace(0, np.nan).dropna())  # log1p on nonzero series
-    if y.empty:
-        return pd.DataFrame({"FECHA":ts.index, "Mensual":ts.values}), pd.DataFrame(), np.nan
-    smapes = []
-    start = max(len(y)-eval_months, 12)
-    if len(y) >= start+1:
-        for t in range(start, len(y)):
-            y_tr = y.iloc[:t]
-            y_te = y.iloc[t:t+1]
-            try:
-                m = SARIMAX(y_tr, order=(1,1,1), seasonal_order=(1,1,1,12), enforce_stationarity=False, enforce_invertibility=False)
-                r = m.fit(disp=False)
-                p = r.get_forecast(steps=1).predicted_mean
-            except Exception:
-                r = ARIMA(y_tr, order=(1,1,1)).fit()
-                p = r.get_forecast(steps=1).predicted_mean
-            smapes.append(smape(np.expm1(y_te.values), np.expm1(p.values)))
-    smape_last = float(np.mean(smapes)) if smapes else np.nan
-    def _adj(arr):
-        return np.expm1(arr) * conservative_factor
-    try:
-        m_full = SARIMAX(y, order=(1,1,1), seasonal_order=(1,1,1,12), enforce_stationarity=False, enforce_invertibility=False)
-        r_full = m_full.fit(disp=False)
-        pred = r_full.get_forecast(steps=steps)
-        mean = _adj(pred.predicted_mean)
-        ci = np.expm1(pred.conf_int(alpha=0.05)) * conservative_factor
-    except Exception:
-        r_full = ARIMA(y, order=(1,1,1)).fit()
-        pred = r_full.get_forecast(steps=steps)
-        mean = _adj(pred.predicted_mean)
-        ci = np.expm1(pred.conf_int(alpha=0.05)) * conservative_factor
-    future_idx = pd.date_range(ts.index.max() + pd.offsets.MonthBegin(), periods=steps, freq="MS")
-    hist_acum = ts.cumsum()
-    forecast_acum = np.cumsum(mean) + (hist_acum.iloc[-1] if len(hist_acum) > 0 else 0.0)
-    fc_df = pd.DataFrame({"FECHA": future_idx, "Forecast_mensual": mean.values.clip(min=0), "Forecast_acum": forecast_acum.values.clip(min=0)})
-    # attach IC if ci available
-    if hasattr(ci, 'iloc'):
-        try:
-            fc_df["IC_lo"] = ci.iloc[:,0].values.clip(min=0)
-            fc_df["IC_hi"] = ci.iloc[:,1].values.clip(min=0)
-        except Exception:
-            fc_df["IC_lo"] = np.nan
-            fc_df["IC_hi"] = np.nan
-    hist_df = pd.DataFrame({"FECHA": ts.index, "Mensual": ts.values, "ACUM": hist_acum.values if len(ts) > 0 else []})
-    return hist_df, fc_df, smape_last
-
-def forecast_year_monthly_for_series(series: pd.Series, target_year: int = 2026, conservative_factor: float = 1.0):
-    """
-    Forecast monthly values for target_year (Jan..Dec) given historical monthly series.
-    Returns a Series indexed by month start dates for the target year.
-    """
-    if series is None or series.empty:
-        # return zeros for 12 months
-        idx = pd.date_range(start=f"{target_year}-01-01", periods=12, freq="MS")
-        return pd.Series([0.0]*12, index=idx)
-    last = series.index.max()
-    last_year = last.year
-    last_month = last.month
-    steps = (target_year - last_year) * 12 + (12 - last_month)
-    # steps is number of months from month after last to Dec target_year inclusive
-    steps = int(max(1, steps))
-    hist_df, fc_df, _ = fit_forecast(series, steps=steps, eval_months=6, conservative_factor=conservative_factor)
-    if fc_df.empty:
-        # fallback: use last 12-month average
-        avg = series.tail(12).mean() if len(series) > 0 else 0.0
-        idx = pd.date_range(start=f"{target_year}-01-01", periods=12, freq="MS")
-        return pd.Series([avg]*12, index=idx)
-    # fc_df starts at month after last
-    fc_df = fc_df.copy()
-    # Filter fc_df rows corresponding to target_year
-    fc_df['YEAR'] = fc_df['FECHA'].dt.year
-    sel = fc_df[fc_df['YEAR'] == target_year]
-    if sel.empty:
-        # maybe fc_df covers beyond target_year; produce zeros
-        idx = pd.date_range(start=f"{target_year}-01-01", periods=12, freq="MS")
-        return pd.Series([0.0]*12, index=idx)
-    # ensure months Jan..Dec present (if some missing, fill with 0)
-    idx = pd.date_range(start=f"{target_year}-01-01", periods=12, freq="MS")
-    out = pd.Series(0.0, index=idx)
-    for _, r in sel.iterrows():
-        d = pd.Timestamp(r['FECHA']).to_period('M').to_timestamp()
-        if d.year == target_year:
-            out.loc[d] = float(r['Forecast_mensual'])
-    return out
-
-# ---------- Data loading & normalization ----------
-def normalize_industria(df: pd.DataFrame) -> pd.DataFrame:
-    """Normaliza nombres de columnas y tipos de datos"""
-    df = df.rename(columns={c: c.strip() for c in df.columns})
-    
-    # Mapeo flexible de columnas
+def normalize_input(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = [c.strip() for c in df.columns]
     colmap = {}
     for c in df.columns:
         cn = c.strip().lower()
         if 'homolog' in cn:
             colmap[c] = 'HOMO'
-        elif cn in ['año','ano','year']:
+        elif cn in ('año','ano','year'):
             colmap[c] = 'ANIO'
-        elif 'compañ' in cn or 'compania' in cn:
+        elif 'compa' in cn or 'compañ' in cn:
             colmap[c] = 'COMPANIA'
         elif 'ciudad' in cn:
             colmap[c] = 'CIUDAD'
         elif 'ram' in cn:
             colmap[c] = 'RAMO'
-        elif ('primas' in cn and 'siniest' in cn) or 'primas/siniestros' in cn:
-            colmap[c] = 'TIPO_VALOR'
-        elif cn in ['primas','siniestros']:
-            colmap[c] = 'TIPO_VALOR'
+        elif 'primas' in cn and 'siniest' in cn:
+            colmap[c] = 'TIPO'
+        elif 'primas/siniestros' in cn or cn == 'primas/siniestros':
+            colmap[c] = 'TIPO'
         elif 'fecha' in cn:
             colmap[c] = 'FECHA'
-        elif 'valor' in cn or 'valor_mensual' in cn:
+        elif 'valor' in cn:
             colmap[c] = 'VALOR'
         elif 'depart' in cn:
             colmap[c] = 'DEPARTAMENTO'
-        elif 'estado' in cn:
-            colmap[c] = 'ESTADO'
-    
     df = df.rename(columns=colmap)
-    
-    # Parse fecha
+
+    # Fecha cleaning
     if 'FECHA' in df.columns:
-        df['FECHA'] = pd.to_datetime(df['FECHA'], dayfirst=True, errors='coerce')
+        ser = df['FECHA'].astype(str).fillna("").str.replace('\u202f',' ').str.replace('\xa0',' ')
+        ser = ser.str.replace(r'(?i)\s*(a\.?\s*m\.?|p\.?\s*m\.?|am|pm)\b', '', regex=True)
+        extracted = ser.str.extract(r'(\d{1,2}[\/\-\.\s]\d{1,2}[\/\-\.\s]\d{2,4})', expand=False)
+        to_parse = extracted.fillna(ser)
+        df['FECHA'] = pd.to_datetime(to_parse, dayfirst=True, errors='coerce')
     else:
-        if 'ANIO' in df.columns and 'MES' in df.columns:
-            try:
-                df['FECHA'] = pd.to_datetime(dict(year=df['ANIO'].astype(int), month=df['MES'].astype(int), day=1), errors='coerce')
-            except Exception:
-                df['FECHA'] = pd.NaT
-        elif 'ANIO' in df.columns:
-            try:
-                df['FECHA'] = pd.to_datetime(df['ANIO'].astype(int).astype(str) + "-01-01", errors='coerce')
-            except Exception:
-                df['FECHA'] = pd.NaT
-        else:
-            df['FECHA'] = pd.NaT
-    
+        df['FECHA'] = pd.NaT
     df['FECHA'] = df['FECHA'].dt.to_period("M").dt.to_timestamp()
-    
-    # Valor numérico
+
+    # VALOR numeric
     if 'VALOR' in df.columns:
         df['VALOR'] = parse_number_co(df['VALOR'])
     else:
-        for alt in ['Valor_Mensual','Valor Mensual','VALOR_MENSUAL','VALOR_MES']:
+        for alt in ['Valor_Mensual','Valor Mensual','VALOR_MENSUAL','valor_mensual','valor mensual']:
             if alt in df.columns:
                 df['VALOR'] = parse_number_co(df[alt])
                 break
         else:
             df['VALOR'] = pd.to_numeric(df.get('VALOR', pd.Series(dtype=float)), errors='coerce')
-    
-    # Tipo normalized
-    if 'TIPO_VALOR' in df.columns:
-        df['TIPO_VALOR'] = df['TIPO_VALOR'].astype(str).str.strip().str.lower()
+
+    # TIPO normalize
+    if 'TIPO' in df.columns:
+        df['TIPO'] = df['TIPO'].astype(str).str.strip().str.capitalize()
     else:
-        df['TIPO_VALOR'] = 'primas'
-    
-    # text clean
-    for c in ['HOMO','COMPANIA','CIUDAD','RAMO','DEPARTAMENTO','ESTADO']:
+        # try auto-detect
+        found = False
+        for c in df.columns:
+            sample = df[c].astype(str).str.lower().head(30).tolist()
+            if any('primas' in s for s in sample) or any('siniest' in s for s in sample):
+                df['TIPO'] = df[c].astype(str).str.strip().str.capitalize()
+                found = True
+                break
+        if not found:
+            df['TIPO'] = 'Primas'  # fallback
+
+    # ensure text fields
+    for c in ['HOMO','COMPANIA','CIUDAD','RAMO','DEPARTAMENTO']:
         if c in df.columns:
             df[c] = df[c].astype(str).str.strip()
-    
+        else:
+            df[c] = "UNKNOWN"
+
     if 'ANIO' not in df.columns:
         df['ANIO'] = df['FECHA'].dt.year
-    
-    keep = ['ANIO','FECHA','HOMO','COMPANIA','CIUDAD','RAMO','TIPO_VALOR','VALOR','DEPARTAMENTO','ESTADO']
+
+    # debug sidebar counts
+    total = len(df)
+    valid_dates = int(df['FECHA'].notna().sum())
+    st.sidebar.write(f"Registros total: {total:,} — FECHA válida: {valid_dates:,}")
+    if valid_dates < total:
+        st.sidebar.markdown("Ejemplos filas sin FECHA válida (revisa formato):")
+        bad = df[df['FECHA'].isna()].head(6)
+        if not bad.empty:
+            st.sidebar.dataframe(bad)
+
+    keep = ['ANIO','FECHA','HOMO','COMPANIA','CIUDAD','RAMO','TIPO','VALOR','DEPARTAMENTO']
     keep = [c for c in keep if c in df.columns]
     return df[keep].dropna(subset=['FECHA']).copy()
 
-def try_load_industria_direct():
-    """
-    Intenta cargar datos desde Google Sheets con manejo robusto de errores
-    Retorna DataFrame normalizado o vacío si falla
-    """
-    url = export_csv_url(DEFAULT_SHEET_ID, DEFAULT_GID)
-    
+# ----------------- Feature engineering & model training ----------------
+def make_lag_features(s: pd.Series, max_lag: int = 12):
+    s = s.sort_index().asfreq("MS").fillna(0.0)
+    df = pd.DataFrame({'y': s})
+    df['year'] = df.index.year
+    df['month'] = df.index.month
+    df['m_sin'] = np.sin(2 * np.pi * df['month'] / 12.0)
+    df['m_cos'] = np.cos(2 * np.pi * df['month'] / 12.0)
+    for l in range(1, max_lag+1):
+        df[f'lag_{l}'] = df['y'].shift(l)
+    df['roll_3'] = df['y'].rolling(3, min_periods=1).mean().shift(1)
+    df['roll_6'] = df['y'].rolling(6, min_periods=1).mean().shift(1)
+    df['roll_12'] = df['y'].rolling(12, min_periods=1).mean().shift(1)
+    return df
+
+def train_xgb_on_series(s: pd.Series, steps: int = 5, conservative_factor: float = 1.0, max_lag: int = 12):
+    s = s.sort_index().asfreq("MS").fillna(0.0)
+    if s.dropna().sum() == 0 or len(s.dropna()) == 0:
+        return [0.0]*steps, np.nan
+    if len(s.dropna()) < 12:
+        # seasonal monthly average fallback
+        monthly_avg = s.groupby(s.index.month).mean()
+        preds = []
+        last = s.index.max()
+        for i in range(1, steps+1):
+            nextm = (last + pd.DateOffset(months=i)).month
+            val = float(monthly_avg.get(nextm, s.mean()))
+            preds.append(max(0.0, val * conservative_factor))
+        return preds, np.nan
+
+    df_feats = make_lag_features(s, max_lag=max_lag).dropna()
+    if df_feats.empty:
+        avg = s.tail(12).mean()
+        return [max(0.0, avg*conservative_factor)]*steps, np.nan
+
+    n = len(df_feats)
+    val_months = min(6, max(3, int(n*0.15)))
+    train_df = df_feats.iloc[:-val_months]
+    val_df = df_feats.iloc[-val_months:]
+
+    X_train = train_df.drop(columns=['y']).values
+    y_train = np.log1p(train_df['y'].values)
+    X_val = val_df.drop(columns=['y']).values
+    y_val = np.log1p(val_df['y'].values)
+
+    feature_cols = list(train_df.drop(columns=['y']).columns)
+
+    if XGBOOST_AVAILABLE:
+        model = XGBRegressor(n_estimators=1000, learning_rate=0.05, max_depth=5,
+                             subsample=0.8, colsample_bytree=0.8, objective='reg:squarederror',
+                             random_state=42, n_jobs=1)
+        try:
+            model.fit(X_train, y_train, eval_set=[(X_val, y_val)], early_stopping_rounds=30, verbose=False)
+        except Exception:
+            model.fit(X_train, y_train)
+    else:
+        model = HistGradientBoostingRegressor(max_iter=500, learning_rate=0.05, max_depth=6, random_state=42)
+        model.fit(X_train, y_train)
+
     try:
-        # Intentar cargar directamente
-        df = pd.read_csv(url)
-        
-        if df.empty:
-            raise ValueError("✅ Conexión exitosa pero la hoja está vacía")
-        
-        df = normalize_industria(df)
-        
-        if df.empty:
-            raise ValueError("✅ Datos cargados pero sin registros válidos después de normalización")
-        
-        st.sidebar.success("✅ Conectado a Google Sheets")
-        return df
-        
+        y_val_pred_log = model.predict(X_val)
+        y_val_pred = np.expm1(y_val_pred_log)
+        y_val_true = np.expm1(y_val)
+        val_smape = smape(y_val_true, y_val_pred)
+    except Exception:
+        val_smape = np.nan
+
+    preds = []
+    hist = s.copy()
+    for i in range(1, steps+1):
+        next_date = hist.index.max() + pd.DateOffset(months=1)
+        row = {}
+        row['year'] = next_date.year
+        row['month'] = next_date.month
+        row['m_sin'] = np.sin(2 * np.pi * row['month'] / 12.0)
+        row['m_cos'] = np.cos(2 * np.pi * row['month'] / 12.0)
+        for l in range(1, max_lag+1):
+            lag_date = next_date - pd.DateOffset(months=l)
+            row[f'lag_{l}'] = hist.get(lag_date, np.nan)
+        row['roll_3'] = hist.tail(3).mean() if len(hist) >= 1 else 0.0
+        row['roll_6'] = hist.tail(6).mean() if len(hist) >= 1 else 0.0
+        row['roll_12'] = hist.tail(12).mean() if len(hist) >= 1 else 0.0
+
+        feat_df = pd.DataFrame([row])
+        for c in feature_cols:
+            if c not in feat_df.columns:
+                feat_df[c] = 0.0
+        feat_df = feat_df[feature_cols]
+        feat_df = feat_df.fillna(feat_df.mean(axis=1).iloc[0])
+        try:
+            y_log_pred = model.predict(feat_df.values)
+            y_pred = float(np.expm1(y_log_pred[0])) if np.isscalar(y_log_pred[0]) or len(np.atleast_1d(y_log_pred))>0 else float(np.expm1(y_log_pred))
+        except Exception:
+            y_pred = float(hist.tail(3).mean() if len(hist)>=3 else hist.mean())
+        y_pred = max(0.0, y_pred * conservative_factor)
+        preds.append(y_pred)
+        hist.loc[next_date] = y_pred
+
+    return preds, float(val_smape) if not np.isnan(val_smape) else np.nan
+
+def smape(y_true, y_pred):
+    y_true = np.array(y_true, dtype=float)
+    y_pred = np.array(y_pred, dtype=float)
+    denom = (np.abs(y_true) + np.abs(y_pred) + 1e-9)
+    return np.mean(2.0 * np.abs(y_pred - y_true) / denom) * 100
+
+# ----------------- UI Flow ----------------
+st.title("Primas & Siniestros — Forecast (Aug–Dec 2025)")
+
+st.sidebar.header("Origen de datos")
+st.sidebar.markdown("La app intentará cargar automáticamente desde la Google Sheet que proporcionaste.")
+sheet_url = st.sidebar.text_input("Google Sheet URL (o Sheet ID)", value=DEFAULT_SHEET_URL_1)
+gid_input = st.sidebar.text_input("GID (opcional)", value=DEFAULT_GID)
+if st.sidebar.button("Forzar recarga desde Google Sheets"):
+    st.cache_data.clear()
+    st.experimental_rerun()
+
+# Try automatic load on start
+df_raw = pd.DataFrame()
+load_error = None
+try:
+    # prefer explicit gid if provided, else try extracted one
+    extracted_gid = extract_gid(sheet_url) or gid_input or DEFAULT_GID
+    df_candidate = try_load_public_sheet(sheet_input=sheet_url, gid=extracted_gid)
+    if not df_candidate.empty:
+        df_raw = df_candidate
+        st.sidebar.success("Google Sheet cargada correctamente (pública).")
+except Exception as e:
+    load_error = e
+    st.sidebar.warning("No se pudo cargar automáticamente la Google Sheet pública. Puedes subir el archivo manualmente.")
+    # show short error in sidebar
+    st.sidebar.text(str(e)[:300])
+
+# Manual upload fallback
+st.sidebar.markdown("---")
+st.sidebar.markdown("O sube un archivo si la Sheet no está pública")
+uploaded_csv = st.sidebar.file_uploader("Subir CSV", type=["csv"])
+uploaded_xlsx = st.sidebar.file_uploader("Subir Excel (.xlsx)", type=["xlsx"])
+if uploaded_csv is not None:
+    try:
+        df_raw = pd.read_csv(StringIO(uploaded_csv.getvalue().decode("utf-8")))
+        st.sidebar.success("CSV cargado.")
     except Exception as e:
-        st.error(f"❌ Error de conexión: {str(e)}")
-        
-        # Mostrar instrucciones VISUALES
-        st.warning("🔧 **INSTRUCCIONES PARA SOLUCIONAR**")
-        
-        with st.expander("📖 PASO 1: Hacer el Google Sheets público (clic para ver detalles)", expanded=True):
-            st.markdown("""
-            1. Abre tu Google Sheets
-            2. Haz clic en **"Compartir"** (arriba derecha, botón azul)
-            3. En "General access", cambia de "Restricted" a **"Anyone with the link"**
-            4. Asegúrate que el rol sea **"Viewer"** (Lector)
-            5. Guarda los cambios
-            
-            **Verifica la conexión con este enlace:**
-            """)
-            st.code(url, language="text")
-        
-        with st.expander("📊 PASO 2: Prueba manual del enlace (opcional)", expanded=False):
-            st.markdown("""
-            Copia y pega este enlace en tu navegador:
-            """)
-            st.code(url, language="text")
-            st.markdown("""
-            - Si **descarga un CSV**, la conexión funcionará
-            - Si ves **error 404**, verifica el ID y GID
-            - Si pide **iniciar sesión**, la hoja NO es pública
-            """)
-        
-        with st.expander("🛠️ PASO 3: Usar datos de ejemplo para pruebas", expanded=False):
-            st.info("Mientras configuras la conexión, puedes usar datos de ejemplo para probar la app")
-            if st.button("▶️ Cargar Datos de Ejemplo"):
-                return generate_sample_data()
-        
-        # Retornar DataFrame vacío para evitar crash
-        return pd.DataFrame()
+        st.sidebar.error("Error leyendo CSV.")
+        st.sidebar.exception(e)
+if uploaded_xlsx is not None:
+    try:
+        df_raw = pd.read_excel(BytesIO(uploaded_xlsx.getvalue()))
+        st.sidebar.success("Excel cargado.")
+    except Exception as e:
+        st.sidebar.error("Error leyendo Excel.")
+        st.sidebar.exception(e)
 
-def generate_sample_data():
-    """Genera datos de ejemplo realistas para pruebas"""
-    st.warning("⚠️ **Usando datos de ejemplo** - Configura tu Google Sheets para datos reales")
-    
-    dates = pd.date_range(start='2020-01-01', end='2025-07-31', freq='M')
-    companias = ['ESTADO', 'MAPFRE', 'LIBERTY', 'AXA', 'MUNDIAL', 'PREVISORA', 'ALFA', 'ALLIANZ']
-    ciudades = ['BOGOTA', 'MEDELLIN', 'CALI', 'BUCARAMANGA', 'BARRANQUILLA', 'CARTAGENA', 'TUNJA', 'BUENAVENTURA']
-    ramos = ['VIDRIOS', 'INCENDIO', 'ROBO', 'RESPONSABILIDAD CIVIL', 'VEHICULOS', 'VIDA', 'SALUD']
-    homologaciones = ['GENERALES', 'ESPECIALES', 'EXCLUIDOS']
-    
-    data = []
-    for date in dates:
-        for compania in companias[:3]:  # Reducido para velocidad
-            for ciudad in ciudades[:4]:
-                for ramo in ramos[:3]:
-                    base_valor = np.random.normal(50000, 15000)
-                    data.append({
-                        'HOMOLOGACIÓN': np.random.choice(homologaciones),
-                        'Año': date.year,
-                        'COMPAÑÍA': compania,
-                        'CIUDAD': ciudad,
-                        'RAMOS': ramo,
-                        'Primas/Siniestros': 'Primas',
-                        'FECHA': date,
-                        'Valor_Mensual': max(0, base_valor),
-                        'DEPARTAMENTO': 'VALLE DEL CAUCA' if ciudad == 'BUENAVENTURA' else 'ANTIOQUIA'
-                    })
-                    # Agregar siniestros (20% de primas en promedio)
-                    data.append({
-                        'HOMOLOGACIÓN': np.random.choice(homologaciones),
-                        'Año': date.year,
-                        'COMPAÑÍA': compania,
-                        'CIUDAD': ciudad,
-                        'RAMOS': ramo,
-                        'Primas/Siniestros': 'Siniestros',
-                        'FECHA': date,
-                        'Valor_Mensual': max(0, base_valor * np.random.normal(0.2, 0.05)),
-                        'DEPARTAMENTO': 'VALLE DEL CAUCA' if ciudad == 'BUENAVENTURA' else 'ANTIOQUIA'
-                    })
-    
-    return pd.DataFrame(data)
+# Option: use sample data
+if df_raw.empty:
+    if st.sidebar.button("Usar datos de ejemplo (temporal)"):
+        # generate small sample
+        dates = pd.date_range(start='2020-01-01', end='2025-07-01', freq='MS')
+        data = []
+        comps = ['ESTADO','MAPFRE','LIBERTY']
+        ciudades = ['BOGOTA','MEDELLIN','CALI']
+        ramos = ['VIDRIOS','INCENDIO','ROBO']
+        homos = ['GENERALES','ESPECIALES']
+        for d in dates:
+            for comp in comps:
+                for c in ciudades:
+                    for r in ramos:
+                        data.append({'HOMOLOGACIÓN': np.random.choice(homos), 'Año': d.year, 'COMPAÑÍA': comp, 'CIUDAD': c, 'RAMOS': r, 'Primas/Siniestros': 'Primas', 'FECHA': d, 'Valor_Mensual': max(0, np.random.normal(50000, 20000)), 'DEPARTAMENTO':'ANTIOQUIA'})
+                        data.append({'HOMOLOGACIÓN': np.random.choice(homos), 'Año': d.year, 'COMPAÑÍA': comp, 'CIUDAD': c, 'RAMOS': r, 'Primas/Siniestros': 'Siniestros', 'FECHA': d, 'Valor_Mensual': max(0, np.random.normal(8000, 3000)), 'DEPARTAMENTO':'ANTIOQUIA'})
+        df_raw = pd.DataFrame(data)
+        st.sidebar.success("Datos de ejemplo cargados.")
 
-# ---------- App UI ----------
-st.title("Industria · Forecast 2026 — por Ciudad / Ramo")
-st.markdown("La app carga automáticamente la Hoja1 indicada y calcula previsiones mes-a-mes para 2026.")
-
-# Carga de datos con manejo robusto de errores
-df_ind = try_load_industria_direct()
-
-# Si no hay datos, detener la app
-if df_ind.empty:
+if df_raw.empty:
+    st.warning("No hay datos cargados. Carga la Google Sheet pública o sube un archivo.")
     st.stop()
 
-# Resto del código para el análisis...
-# [Aquí va el resto de tu código original de análisis y forecasting]
-# Asegúrate de envolver cada sección en try-except para manejar errores
+# Debug preview of raw columns
+st.sidebar.markdown("### Columnas detectadas (crudas)")
+st.sidebar.write(df_raw.columns.tolist())
+st.write("### Muestra cruda (primeras filas)")
+st.dataframe(df_raw.head(5))
 
-# Agregar botón de recarga en sidebar
+# Normalize
+try:
+    df = normalize_input(df_raw)
+except Exception as e:
+    st.error("Error al normalizar los datos.")
+    st.exception(e)
+    st.stop()
+
+# Show normalized preview
+st.markdown("### Muestra normalizada (primeras filas)")
+st.dataframe(df.head(6))
+
+# Filters
 st.sidebar.markdown("---")
-if st.sidebar.button("🔄 Recargar Datos"):
-    st.cache_data.clear()
-    st.rerun()
+st.sidebar.header("Filtros para predicción")
+company_opts = ["TODAS"] + sorted(df['COMPANIA'].dropna().unique().tolist())
+city_opts = ["TODAS"] + sorted(df['CIUDAD'].dropna().unique().tolist())
+ramo_opts = ["TODAS"] + sorted(df['RAMO'].dropna().unique().tolist())
 
-# Footer
-st.sidebar.info("""
-**Conexión:** Google Sheets  
-**Última actualización:** {}  
-**Registros:** {:,}
-""".format(
-    df_ind['FECHA'].max().strftime('%Y-%m-%d') if not df_ind.empty else 'N/A',
-    len(df_ind)
-))
+company_sel = st.sidebar.selectbox("Compañía", company_opts)
+city_sel = st.sidebar.selectbox("Ciudad", city_opts)
+ramo_sel = st.sidebar.selectbox("Ramo", ramo_opts)
+conservative_pct = st.sidebar.slider("Ajuste conservador (%)", -20.0, 20.0, 0.0, step=0.5)
+conservative_factor = 1.0 + conservative_pct/100.0
+
+# Apply filters
+df_f = df.copy()
+if company_sel != "TODAS":
+    df_f = df_f[df_f['COMPANIA'] == company_sel]
+if city_sel != "TODAS":
+    df_f = df_f[df_f['CIUDAD'] == city_sel]
+if ramo_sel != "TODAS":
+    df_f = df_f[df_f['RAMO'] == ramo_sel]
+
+if df_f.empty:
+    st.warning("No hay datos con los filtros seleccionados.")
+    st.stop()
+
+st.write(f"Registros después de filtros: {len(df_f):,} — Periodo: {df_f['FECHA'].min().date()} to {df_f['FECHA'].max().date()}")
+
+# Global plot for Primas/Siniestros
+ts_pr = df_f[df_f['TIPO'].str.lower() == 'primas'].groupby('FECHA')['VALOR'].sum().sort_index()
+ts_si = df_f[df_f['TIPO'].str.lower() == 'siniestros'].groupby('FECHA')['VALOR'].sum().sort_index()
+
+fig = go.Figure()
+if not ts_pr.empty:
+    fig.add_trace(go.Scatter(x=ts_pr.index, y=ts_pr.values, name='Primas'))
+if not ts_si.empty:
+    fig.add_trace(go.Scatter(x=ts_si.index, y=ts_si.values, name='Siniestros'))
+fig.update_layout(title="Serie histórica agregada", yaxis_title="Valor mensual (COP)", xaxis=dict(type="date", rangeslider=dict(visible=True)))
+st.plotly_chart(fig, use_container_width=True)
+
+# Group by HOMO x TIPO
+st.markdown("## Predicciones por HOMOLOGACIÓN (Agosto-Diciembre 2025)")
+groups = df_f.groupby(['HOMO','TIPO'])
+
+primas_rows = []
+sini_rows = []
+total = len(groups)
+pbar = st.progress(0)
+idx = 0
+
+for (homo, tipo), g in groups:
+    idx += 1
+    pbar.progress(int(idx/total*100))
+    s = g.set_index('FECHA').sort_index().groupby('FECHA')['VALOR'].sum()
+    s = s.asfreq("MS").fillna(0.0)
+    preds, val_smape = train_xgb_on_series(s, steps=len(TARGET_MONTHS), conservative_factor=conservative_factor)
+    row = {'HOMOLOGACIÓN': homo}
+    for dt, p in zip(TARGET_MONTHS, preds):
+        row[dt.strftime("%b-%Y")] = round(p, 0)
+    row['SMAPE_val'] = round(val_smape, 2) if not np.isnan(val_smape) else None
+    if tipo.lower().startswith('p'):
+        primas_rows.append(row)
+    else:
+        sini_rows.append(row)
+
+pbar.empty()
+
+primas_df = pd.DataFrame(primas_rows).set_index('HOMOLOGACIÓN') if primas_rows else pd.DataFrame()
+sini_df = pd.DataFrame(sini_rows).set_index('HOMOLOGACIÓN') if sini_rows else pd.DataFrame()
+
+st.subheader("Primas — predicción (COP)")
+if not primas_df.empty:
+    st.dataframe(primas_df.fillna(0).style.format(lambda v: f"${int(v):,}".replace(",", ".") if pd.notna(v) and v!=0 else "-"), use_container_width=True)
+else:
+    st.info("No hay predicciones de primas.")
+
+st.subheader("Siniestros — predicción (COP)")
+if not sini_df.empty:
+    st.dataframe(sini_df.fillna(0).style.format(lambda v: f"${int(v):,}".replace(",", ".") if pd.notna(v) and v!=0 else "-"), use_container_width=True)
+else:
+    st.info("No hay predicciones de siniestros.")
+
+# Aggregated by city
+st.markdown("### Agregado por CIUDAD — Predicción (Agosto-Diciembre 2025)")
+if not primas_df.empty:
+    homo_city = df_f.groupby('HOMO')['CIUDAD'].agg(lambda s: s.mode().iat[0] if not s.mode().empty else "UNKNOWN")
+    tmp = primas_df.reset_index().merge(homo_city.rename('CIUDAD'), left_on='HOMOLOGACIÓN', right_index=True, how='left')
+    agg_city_pr = tmp.groupby('CIUDAD')[TARGET_MONTHS_STR].sum().round(0)
+    st.dataframe(agg_city_pr.style.format(lambda v: f"${int(v):,}".replace(",", ".")), use_container_width=True)
+if not sini_df.empty:
+    homo_city = df_f.groupby('HOMO')['CIUDAD'].agg(lambda s: s.mode().iat[0] if not s.mode().empty else "UNKNOWN")
+    tmp = sini_df.reset_index().merge(homo_city.rename('CIUDAD'), left_on='HOMOLOGACIÓN', right_index=True, how='left')
+    agg_city_si = tmp.groupby('CIUDAD')[TARGET_MONTHS_STR].sum().round(0)
+    st.dataframe(agg_city_si.style.format(lambda v: f"${int(v):,}".replace(",", ".")), use_container_width=True)
+
+# Download results
+if (not primas_df.empty) or (not sini_df.empty):
+    with BytesIO() as out:
+        with pd.ExcelWriter(out, engine="openpyxl") as writer:
+            if not primas_df.empty:
+                primas_df.to_excel(writer, sheet_name="Primas_HOMO")
+            if not sini_df.empty:
+                sini_df.to_excel(writer, sheet_name="Siniestros_HOMO")
+            try:
+                if 'agg_city_pr' in locals():
+                    agg_city_pr.to_excel(writer, sheet_name="Primas_CIUDAD")
+                if 'agg_city_si' in locals():
+                    agg_city_si.to_excel(writer, sheet_name="Siniestros_CIUDAD")
+            except Exception:
+                pass
+        data = out.getvalue()
+    st.download_button("⬇️ Descargar predicciones (Excel)", data=data, file_name="predicciones_Ago-Dic-2025.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+st.sidebar.markdown("---")
+st.sidebar.write(f"Última fecha en datos: {df['FECHA'].max().date()}")
+st.sidebar.write(f"Series históricas (meses): {df['FECHA'].nunique()}")
