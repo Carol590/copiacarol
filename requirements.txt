@@ -1,14 +1,16 @@
 streamlit
 pandas
 numpy
-plotly
-statsmodels
-scipy
-patsy
-openpyxl
 xgboost
+prophet
+plotly
+matplotlib
+seaborn
 scikit-learn
-
+openpyxl
+gspread
+oauth2client
+requests
 
 
 
