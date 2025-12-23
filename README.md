@@ -73,4 +73,10 @@ Si quieres que:
 - o empaquete la app para despliegue en Streamlit Cloud con secrets configurados,
 dímelo y lo preparo.
 ```
+## Despliegue
+[Insertar badge de Streamlit aquí]
 
+## Instalación Local
+```bash
+pip install -r requirements.txt
+streamlit run app.py
