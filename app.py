@@ -152,7 +152,7 @@ def train_forecast_xgb(series: pd.Series, steps: int = 5, min_months: int = 12, 
 
     # select model
     if XGBOOST_AVAILABLE:
-        model = XGBRegressor(n_estimators=300, learning_rate=0.05, max_depth=4, subsample=0.8, colsample_bytree=0.8, random_stathttps://github.com/copilot/c/9d1fc696-c64f-4464-a97b-a5a356096ac8#e=42, n_jobs=1)
+        model = XGBRegressor(n_estimators=300, learning_rate=0.05, max_depth=4, subsample=0.8, colsample_bytree=0.8, random_state=42, n_jobs=1)
     else:
         model = HistGradientBoostingRegressor(max_iter=300, learning_rate=0.05, max_depth=6, random_state=42)
 
@@ -188,10 +188,48 @@ def train_forecast_xgb(series: pd.Series, steps: int = 5, min_months: int = 12, 
         hist.loc[next_idx] = p
     return preds
 
+# ----------------- Google Sheets loader (public) -----------------
+def csv_by_gid(sheet_id: str, gid: str = "0") -> str:
+    return f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
+
+def gviz_csv(sheet_id: str, sheet_name: str) -> str:
+    return f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv&sheet={sheet_name}"
+
+def try_load_public_sheet(sheet_id: str, sheet_name: str = None, gid: str = "0") -> pd.DataFrame:
+    """
+    Try to load a public Google Sheet as CSV.
+    Prefer gviz by sheet name (if provided), otherwise try gid export.
+    """
+    last_err = None
+    if sheet_name:
+        try:
+            url = gviz_csv(sheet_id, sheet_name)
+            df = pd.read_csv(url)
+            return df
+        except Exception as e:
+            last_err = e
+    # try by GID (default 0)
+    try:
+        url = csv_by_gid(sheet_id, gid)
+        df = pd.read_csv(url)
+        return df
+    except Exception as e:
+        last_err = e
+    raise RuntimeError(f"No se pudo leer la hoja pública. Último error: {last_err}")
+
 # ----------------- Caching helpers -----------------
 @st.cache_data(show_spinner=False)
-def build_aggregates_from_csv(csv_text: str) -> pd.DataFrame:
-    df = pd.read_csv(StringIO(csv_text))
+def build_aggregates_from_csv(csv_text: str = None, sheet_id: str = None, sheet_name: str = None, gid: str = "0") -> pd.DataFrame:
+    """
+    Si csv_text se pasa, lo usa; si no, intenta leer la Google Sheet pública con sheet_id.
+    Devuelve el dataframe agregado listo para el app.
+    """
+    if csv_text:
+        df = pd.read_csv(StringIO(csv_text))
+    else:
+        if not sheet_id:
+            raise RuntimeError("No csv_text ni sheet_id provistos para build_aggregates.")
+        df = try_load_public_sheet(sheet_id=sheet_id, sheet_name=sheet_name, gid=gid)
     df = parse_input_dates(df)
     agg = aggregate_monthly(df)
     return agg
@@ -201,7 +239,7 @@ def compute_predictions_table(agg_csv: str, company_filter: str, city_filter: st
     """
     Devuelve dos tablas (primas_preds, siniestros_preds) indexadas por HOMOLOGACIÓN y columnas para TARGET_MONTHS.
     """
-    agg = build_aggregates_from_csv(agg_csv)
+    agg = build_aggregates_from_csv(csv_text=agg_csv)
 
     # Apply filters
     df = agg.copy()
@@ -243,16 +281,62 @@ def compute_predictions_table(agg_csv: str, company_filter: str, city_filter: st
 # ----------------- Streamlit UI -----------------
 st.title("Forecast Primas & Siniestros — XGBoost (Prototipo)")
 
-st.sidebar.header("Carga de datos")
-uploaded = st.sidebar.file_uploader("Sube CSV con datos", type=["csv"], accept_multiple_files=False)
-if uploaded is None:
-    st.sidebar.info("Sube un CSV con las columnas esperadas o pega el contenido.")
+# Default public Google Sheet (user provided)
+DEFAULT_SHEET_ID = "1VljNnZtRPDA3TkTUP6w8AviZCPIfILqe"  # <- sheet you gave
+
+st.sidebar.header("Fuente de datos")
+source = st.sidebar.radio("Selecciona fuente", ["Google Sheet pública (por defecto)", "Subir CSV"], index=0)
+
+sheet_id_input = DEFAULT_SHEET_ID
+sheet_name_input = None
+gid_input = "0"
+csv_text = None
+
+if source == "Google Sheet pública (por defecto)":
+    st.sidebar.markdown("Se usará la hoja pública indicada (si es accesible públicamente).")
+    sheet_id_input = st.sidebar.text_input("Sheet ID", value=DEFAULT_SHEET_ID)
+    sheet_name_input = st.sidebar.text_input("Nombre de pestaña (opcional)", value="")
+    gid_input = st.sidebar.text_input("GID de la pestaña (opcional, por defecto 0)", value="0")
+    if st.sidebar.button("Cargar Google Sheet"):
+        try:
+            with st.spinner("Cargando Google Sheet pública..."):
+                df_loaded = try_load_public_sheet(sheet_id_input, sheet_name_input if sheet_name_input else None, gid=gid_input if gid_input else "0")
+                csv_text = df_loaded.to_csv(index=False)
+                st.success("Hoja cargada correctamente.")
+                st.write(df_loaded.head(3))
+        except Exception as e:
+            st.error("No se pudo cargar la Google Sheet pública. Comprueba permisos o que la hoja sea pública.")
+            st.exception(e)
+            csv_text = None
+    else:
+        # attempt automatic silent load on first run to honor "dame todo con the sheet"
+        try:
+            with st.spinner("Intentando cargar Google Sheet pública (automático)..."):
+                df_loaded = try_load_public_sheet(sheet_id_input, None, gid="0")
+                csv_text = df_loaded.to_csv(index=False)
+                st.success("Hoja pública cargada automáticamente.")
+                st.write(df_loaded.head(3))
+        except Exception:
+            # will ask user to click "Cargar Google Sheet" or upload CSV
+            st.sidebar.info("Si la carga automática falla, pulsa 'Cargar Google Sheet' o sube un CSV.")
+            csv_text = None
+
+elif source == "Subir CSV":
+    uploaded = st.sidebar.file_uploader("Sube CSV con datos", type=["csv"], accept_multiple_files=False)
+    if uploaded:
+        csv_text = uploaded.getvalue().decode("utf-8")
+        st.sidebar.success("CSV cargado.")
+        st.write(pd.read_csv(StringIO(csv_text)).head(3))
+    else:
+        st.sidebar.info("Sube un CSV si no quieres usar Google Sheet pública.")
+
+if csv_text is None:
+    st.warning("No hay datos cargados todavía. Usa la barra lateral para cargar desde Google Sheets pública o subir un CSV.")
     st.stop()
 
-csv_text = uploaded.getvalue().decode("utf-8")
 # Precompute aggregates
 with st.spinner("Procesando dataset..."):
-    agg = build_aggregates_from_csv(csv_text)
+    agg = build_aggregates_from_csv(csv_text=csv_text)
 
 # Sidebar filters
 st.sidebar.header("Filtros")
