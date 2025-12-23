@@ -1,19 +1,21 @@
 # -*- coding: utf-8 -*-
 """
 app.py
-Carga automática desde Google Sheets (por defecto la URL que diste) y predice Primas y Siniestros
-(Agosto-Diciembre 2025) usando XGBoost/fallback por serie (HOMOLOGACIÓN x TIPO).
-Incluye parser robusto de números y herramienta de diagnóstico.
+Streamlit app: Predicción de Primas y Siniestros (Agosto-Diciembre 2025)
+- Carga desde Google Sheet pública (URL/ID + GID) o permite subir CSV/XLSX
+- Normaliza columnas (FECHA, VALOR, HOMOLOGACIÓN, Primas/Siniestros, COMPAÑÍA, CIUDAD, RAMO, DEPARTAMENTO)
+- Parser robusto de números (puntos/comas como miles/decimales)
+- Entrena XGBoost (si está disponible) por serie (HOMO x TIPO) con fallback a HistGradientBoostingRegressor
+- Añade herramienta de diagnóstico para inspeccionar discrepancias en sumas
 """
 import warnings
 warnings.filterwarnings("ignore")
 
 import re
 from io import BytesIO, StringIO
-from urllib.parse import quote, urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs
 import requests
 import os
-import json
 
 import streamlit as st
 import pandas as pd
@@ -30,30 +32,25 @@ except Exception:
 
 from sklearn.ensemble import HistGradientBoostingRegressor
 
-# ---------------- Config (DEFAULT sheet links you provided) ----------------
-DEFAULT_SHEET_URL_1 = "https://docs.google.com/spreadsheets/d/1VljNnZtRPDA3TkTUP6w8AviZCPIfILqe/edit?usp=sharing&ouid=112431990130910944357&rtpof=true&sd=true"
-DEFAULT_SHEET_URL_2 = "https://docs.google.com/spreadsheets/d/1VljNnZtRPDA3TkTUP6w8AviZCPIfILqe/edit?gid=293107109#gid=293107109"
-DEFAULT_SHEET_ID = "1VljNnZtRPDA3TkTUP6w8AviZCPIfILqe"
+# ---------------- Config ----------------
+st.set_page_config(page_title="Primas & Siniestros — Forecast XGBoost", layout="wide")
+DEFAULT_SHEET_URL = "https://docs.google.com/spreadsheets/d/1VljNnZtRPDA3TkTUP6w8AviZCPIfILqe/edit?usp=sharing"
 DEFAULT_GID = "293107109"
 
 TARGET_START = pd.Timestamp("2025-08-01")
 TARGET_MONTHS = pd.date_range(start=TARGET_START, periods=5, freq="MS")  # Aug-Dec 2025
 TARGET_MONTHS_STR = [d.strftime("%b-%Y") for d in TARGET_MONTHS]
 
-st.set_page_config(page_title="Primas & Siniestros — Forecast XGB", layout="wide")
-
-# ---------------- Helpers: sheet id / gid extraction and loading ----------------
+# ---------------- Sheet helpers ----------------
 def extract_sheet_id(url_or_id: str) -> str:
     if not isinstance(url_or_id, str):
         return ""
     s = url_or_id.strip()
-    # if already looks like id
     if re.fullmatch(r"[A-Za-z0-9_\-]{10,}", s):
         return s
     m = re.search(r"/d/([a-zA-Z0-9-_]+)", s)
     if m:
         return m.group(1)
-    # fallback: query param id=
     parsed = urlparse(s)
     qs = parse_qs(parsed.query)
     if 'id' in qs:
@@ -76,7 +73,7 @@ def export_csv_url(sheet_id: str, gid: str = "0") -> str:
 
 def try_load_public_sheet(sheet_input: str = None, gid: str = None, timeout: int = 20):
     """
-    Try multiple public endpoints (export by gid, gviz by sheet name, pub output).
+    Try multiple public endpoints (export by gid, pub CSV, gviz).
     Returns DataFrame or raises RuntimeError with details.
     """
     if not sheet_input:
@@ -85,31 +82,27 @@ def try_load_public_sheet(sheet_input: str = None, gid: str = None, timeout: int
     if not sheet_id:
         raise RuntimeError("No sheet id could be extracted.")
 
-    tried = []
-    errors = []
+    candidates = []
     gid_use = gid if gid and gid.strip() else "0"
-    candidates = [
-        export_csv_url(sheet_id, gid_use),
-        export_csv_url(sheet_id, "0"),
-        f"https://docs.google.com/spreadsheets/d/{sheet_id}/pub?output=csv",
-        f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv"
-    ]
+    candidates.append(export_csv_url(sheet_id, gid_use))
+    candidates.append(export_csv_url(sheet_id, "0"))
+    candidates.append(f"https://docs.google.com/spreadsheets/d/{sheet_id}/pub?output=csv")
+    candidates.append(f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv")
 
     last_status = None
+    errors = []
     for url in candidates:
-        tried.append(url)
         try:
             resp = requests.get(url, timeout=timeout)
             last_status = resp.status_code
             if resp.status_code == 200:
                 text = resp.text
-                # quick sanity check: lots of commas/newlines
                 if ("," in text) and ("\n" in text):
                     try:
                         df = pd.read_csv(StringIO(text))
                         return df
                     except Exception as e:
-                        errors.append((url, f"200 OK but CSV parse failed: {e}"))
+                        errors.append((url, f"CSV parse failed: {e}"))
                         continue
                 else:
                     errors.append((url, f"200 OK but content not CSV-like (len {len(text)})"))
@@ -119,29 +112,22 @@ def try_load_public_sheet(sheet_input: str = None, gid: str = None, timeout: int
             errors.append((url, f"Exception: {type(e).__name__}: {e}"))
             continue
 
-    msg = "Could not load public sheet. Tried:\n" + "\n".join([f"- {u}" for u in tried]) + "\nErrors:\n" + "\n".join([f"- {u} -> {e}" for u, e in errors])
+    msg = "Could not load public sheet. Tried URLs and errors:\n" + "\n".join([f"- {u} -> {e}" for u, e in errors])
     raise RuntimeError(msg + f"\nLast status: {last_status}")
 
-# ---------------- Normalization (robust) ----------------
+# ---------------- Parsing numbers robust ----------------
 def parse_number_co(series: pd.Series) -> pd.Series:
     """
-    Robust parser for Colombian / Latin numeric formats.
-    Rules:
-    - If both '.' and ',' present: assume '.' thousands, ',' decimal -> remove dots and replace comma with dot
-      e.g. "1.234.567,89" -> 1234567.89
-    - If only ',' present:
-      - if digits after last comma == 3 and there is more than one part -> probably thousands separators -> remove commas
-      - else consider comma decimal: replace ',' -> '.'
-    - If only '.' present:
-      - if digits after last dot == 3 and there is more than one part -> thousands separators -> remove dots
-      - else consider dot decimal -> keep
-    - If none present: numeric as-is
-    Fallback: remove non-digits and convert.
+    Robust parser for numbers with dots/commas.
+    Handles:
+      - "1.234.567,89" -> 1234567.89
+      - "1,234,567.89" -> 1234567.89
+      - "1.249" -> 1249 (if part after dot has 3 digits it's thousands separator)
+      - "1249.5" -> 1249.5 (dot decimal)
+      - "1249" -> 1249
     """
     import numpy as _np
     s = series.astype(str).fillna("").str.strip()
-
-    # remove currency symbols/spaces except . , -
     s = s.str.replace(r"[^\d\-,\.]", "", regex=True)
 
     def _parse_one(x: str):
@@ -154,29 +140,22 @@ def parse_number_co(series: pd.Series) -> pd.Series:
         has_comma = "," in x
         try:
             if has_dot and has_comma:
-                # ex: "1.234.567,89" or "1,234,567.89"
-                # Heuristic: if last separator is comma -> comma decimal, else if last is dot -> dot decimal
+                # decide by last separator
                 if x.rfind(",") > x.rfind("."):
-                    # comma is decimal -> remove dots and replace comma
                     x2 = x.replace(".", "").replace(",", ".")
                 else:
-                    # dot is decimal -> remove commas
                     x2 = x.replace(",", "")
             elif has_comma and not has_dot:
                 parts = x.split(",")
                 if len(parts[-1]) == 3 and len(parts) > 1:
-                    # likely thousands separators -> remove commas
                     x2 = x.replace(",", "")
                 else:
-                    # decimal
                     x2 = x.replace(",", ".")
             elif has_dot and not has_comma:
                 parts = x.split(".")
                 if len(parts[-1]) == 3 and len(parts) > 1:
-                    # dot used as thousands separator
                     x2 = x.replace(".", "")
                 else:
-                    # dot likely decimal
                     x2 = x
             else:
                 x2 = x
@@ -184,7 +163,6 @@ def parse_number_co(series: pd.Series) -> pd.Series:
                 return _np.nan
             return float(x2)
         except Exception:
-            # last resort: strip non digits and convert
             digits = re.sub(r"[^\d\-\.]", "", x)
             try:
                 return float(digits) if digits != "" else _np.nan
@@ -194,9 +172,9 @@ def parse_number_co(series: pd.Series) -> pd.Series:
     parsed = s.map(_parse_one)
     return pd.to_numeric(parsed, errors="coerce")
 
+# ---------------- Normalization ----------------
 def normalize_input(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    # preserve a copy of the raw columns for diagnosis
     df_raw_backup = df.copy()
     df.columns = [c.strip() for c in df.columns]
     colmap = {}
@@ -226,11 +204,10 @@ def normalize_input(df: pd.DataFrame) -> pd.DataFrame:
             colmap[c] = 'DEPARTAMENTO'
     df = df.rename(columns=colmap)
 
-    # store raw value text if original present
+    # keep raw text of value column for diagnosis
     if orig_val_col:
         df['VALOR_RAW'] = df_raw_backup[orig_val_col].astype(str)
     else:
-        # try common alt names
         for alt in ['Valor_Mensual','Valor Mensual','VALOR_MENSUAL','valor_mensual','valor mensual']:
             if alt in df_raw_backup.columns:
                 df['VALOR_RAW'] = df_raw_backup[alt].astype(str)
@@ -239,7 +216,7 @@ def normalize_input(df: pd.DataFrame) -> pd.DataFrame:
         else:
             df['VALOR_RAW'] = ""
 
-    # Fecha cleaning
+    # FECHA cleaning
     if 'FECHA' in df.columns:
         ser = df['FECHA'].astype(str).fillna("").str.replace('\u202f',' ').str.replace('\xa0',' ')
         ser = ser.str.replace(r'(?i)\s*(a\.?\s*m\.?|p\.?\s*m\.?|am|pm)\b', '', regex=True)
@@ -250,7 +227,7 @@ def normalize_input(df: pd.DataFrame) -> pd.DataFrame:
         df['FECHA'] = pd.NaT
     df['FECHA'] = df['FECHA'].dt.to_period("M").dt.to_timestamp()
 
-    # VALOR numeric (use robust parser)
+    # VALOR numeric
     if 'VALOR' in df.columns:
         df['VALOR'] = parse_number_co(df['VALOR'])
     else:
@@ -265,7 +242,6 @@ def normalize_input(df: pd.DataFrame) -> pd.DataFrame:
     if 'TIPO' in df.columns:
         df['TIPO'] = df['TIPO'].astype(str).str.strip().str.capitalize()
     else:
-        # try auto-detect
         found = False
         for c in df.columns:
             sample = df[c].astype(str).str.lower().head(30).tolist()
@@ -274,9 +250,9 @@ def normalize_input(df: pd.DataFrame) -> pd.DataFrame:
                 found = True
                 break
         if not found:
-            df['TIPO'] = 'Primas'  # fallback
+            df['TIPO'] = 'Primas'
 
-    # ensure text fields
+    # Ensure text fields
     for c in ['HOMO','COMPANIA','CIUDAD','RAMO','DEPARTAMENTO']:
         if c in df.columns:
             df[c] = df[c].astype(str).str.strip()
@@ -286,7 +262,6 @@ def normalize_input(df: pd.DataFrame) -> pd.DataFrame:
     if 'ANIO' not in df.columns:
         df['ANIO'] = df['FECHA'].dt.year
 
-    # debug sidebar counts
     total = len(df)
     valid_dates = int(df['FECHA'].notna().sum())
     st.sidebar.write(f"Registros total: {total:,} — FECHA válida: {valid_dates:,}")
@@ -300,7 +275,7 @@ def normalize_input(df: pd.DataFrame) -> pd.DataFrame:
     keep = [c for c in keep if c in df.columns]
     return df[keep].dropna(subset=['FECHA']).copy()
 
-# ----------------- Feature engineering & model training ----------------
+# ---------------- Features & Model ----------------
 def make_lag_features(s: pd.Series, max_lag: int = 12):
     s = s.sort_index().asfreq("MS").fillna(0.0)
     df = pd.DataFrame({'y': s})
@@ -315,12 +290,22 @@ def make_lag_features(s: pd.Series, max_lag: int = 12):
     df['roll_12'] = df['y'].rolling(12, min_periods=1).mean().shift(1)
     return df
 
+def smape(y_true, y_pred):
+    y_true = np.array(y_true, dtype=float)
+    y_pred = np.array(y_pred, dtype=float)
+    denom = (np.abs(y_true) + np.abs(y_pred) + 1e-9)
+    return np.mean(2.0 * np.abs(y_pred - y_true) / denom) * 100
+
 def train_xgb_on_series(s: pd.Series, steps: int = 5, conservative_factor: float = 1.0, max_lag: int = 12):
+    """
+    Robust training & iterative forecasting.
+    Returns preds (list length=steps) and val_smape (float or nan).
+    """
     s = s.sort_index().asfreq("MS").fillna(0.0)
     if s.dropna().sum() == 0 or len(s.dropna()) == 0:
         return [0.0]*steps, np.nan
+
     if len(s.dropna()) < 12:
-        # seasonal monthly average fallback
         monthly_avg = s.groupby(s.index.month).mean()
         preds = []
         last = s.index.max()
@@ -331,42 +316,100 @@ def train_xgb_on_series(s: pd.Series, steps: int = 5, conservative_factor: float
         return preds, np.nan
 
     df_feats = make_lag_features(s, max_lag=max_lag).dropna()
-    if df_feats.empty:
+    if df_feats.empty or 'y' not in df_feats:
         avg = s.tail(12).mean()
         return [max(0.0, avg*conservative_factor)]*steps, np.nan
 
     n = len(df_feats)
-    val_months = min(6, max(3, int(n*0.15)))
-    train_df = df_feats.iloc[:-val_months]
-    val_df = df_feats.iloc[-val_months:]
+    val_months = min(6, max(3, int(n * 0.15)))
+    train_df = df_feats.iloc[:-val_months].copy()
+    val_df = df_feats.iloc[-val_months:].copy()
 
-    X_train = train_df.drop(columns=['y']).values
-    y_train = np.log1p(train_df['y'].values)
-    X_val = val_df.drop(columns=['y']).values
-    y_val = np.log1p(val_df['y'].values)
+    # sanitize y
+    train_df['y'] = train_df['y'].apply(lambda x: 0.0 if (pd.isna(x) or x < 0) else x)
+    val_df['y'] = val_df['y'].apply(lambda x: 0.0 if (pd.isna(x) or x < 0) else x)
+
+    train_df = train_df[np.isfinite(train_df['y'])]
+    val_df = val_df[np.isfinite(val_df['y'])]
+
+    if len(train_df) < 6:
+        avg = s.tail(12).mean()
+        st.warning(f"Serie corta para entrenamiento (n_train={len(train_df)}). Usando promedio fallback.")
+        return [max(0.0, avg * conservative_factor)]*steps, np.nan
+
+    X_train_df = train_df.drop(columns=['y']).copy()
+    X_val_df = val_df.drop(columns=['y']).copy()
+
+    # fill NaNs in X with column mean (or 0)
+    for col in X_train_df.columns:
+        col_mean = X_train_df[col].replace([np.inf, -np.inf], np.nan).mean()
+        if np.isnan(col_mean):
+            col_mean = 0.0
+        X_train_df[col] = X_train_df[col].replace([np.inf, -np.inf], np.nan).fillna(col_mean)
+    for col in X_val_df.columns:
+        if col in X_train_df.columns:
+            col_mean = X_train_df[col].mean()
+        else:
+            col_mean = 0.0
+        X_val_df[col] = X_val_df[col].replace([np.inf, -np.inf], np.nan).fillna(col_mean)
+
+    X_train = X_train_df.values.astype(np.float32)
+    X_val = X_val_df.values.astype(np.float32)
+    y_train = np.log1p(train_df['y'].values.astype(np.float32))
+    y_val = np.log1p(val_df['y'].values.astype(np.float32)) if len(val_df)>0 else np.array([])
+
+    if not np.all(np.isfinite(X_train)) or not np.all(np.isfinite(y_train)):
+        avg = s.tail(12).mean()
+        st.warning("NaN/Inf en X_train o y_train detectados; usando fallback promedio.")
+        return [max(0.0, avg * conservative_factor)]*steps, np.nan
 
     feature_cols = list(train_df.drop(columns=['y']).columns)
 
+    model = None
     if XGBOOST_AVAILABLE:
-        model = XGBRegressor(n_estimators=1000, learning_rate=0.05, max_depth=5,
-                             subsample=0.8, colsample_bytree=0.8, objective='reg:squarederror',
-                             random_state=42, n_jobs=1)
         try:
-            model.fit(X_train, y_train, eval_set=[(X_val, y_val)], early_stopping_rounds=30, verbose=False)
-        except Exception:
-            model.fit(X_train, y_train)
-    else:
-        model = HistGradientBoostingRegressor(max_iter=500, learning_rate=0.05, max_depth=6, random_state=42)
-        model.fit(X_train, y_train)
+            model = XGBRegressor(
+                n_estimators=500,
+                learning_rate=0.05,
+                max_depth=5,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                objective='reg:squarederror',
+                random_state=42,
+                n_jobs=1,
+                verbosity=0
+            )
+            if len(y_val) > 0:
+                model.fit(X_train, y_train, eval_set=[(X_val, y_val)], early_stopping_rounds=30, verbose=False)
+            else:
+                model.fit(X_train, y_train)
+        except Exception as e:
+            st.warning(f"XGBoost fit error: {str(e)[:200]}. Fallback to sklearn model.")
+            model = None
 
+    if model is None:
+        try:
+            model_sk = HistGradientBoostingRegressor(max_iter=200, learning_rate=0.05, max_depth=6, random_state=42)
+            model_sk.fit(X_train, y_train)
+            model = model_sk
+        except Exception as e:
+            st.error(f"Fallback model training failed: {e}")
+            avg = s.tail(12).mean()
+            return [max(0.0, avg * conservative_factor)]*steps, np.nan
+
+    # validation smape
     try:
-        y_val_pred_log = model.predict(X_val)
-        y_val_pred = np.expm1(y_val_pred_log)
-        y_val_true = np.expm1(y_val)
-        val_smape = smape(y_val_true, y_val_pred)
+        if len(y_val) > 0:
+            y_val_pred_log = model.predict(X_val)
+            y_val_pred = np.expm1(y_val_pred_log)
+            y_val_true = np.expm1(y_val)
+            val_sm = smape(y_val_true, y_val_pred)
+        else:
+            val_sm = np.nan
     except Exception:
-        val_smape = np.nan
+        val_sm = np.nan
 
+    # iterative forecasting
     preds = []
     hist = s.copy()
     for i in range(1, steps+1):
@@ -389,8 +432,9 @@ def train_xgb_on_series(s: pd.Series, steps: int = 5, conservative_factor: float
                 feat_df[c] = 0.0
         feat_df = feat_df[feature_cols]
         feat_df = feat_df.fillna(feat_df.mean(axis=1).iloc[0])
+
         try:
-            y_log_pred = model.predict(feat_df.values)
+            y_log_pred = model.predict(feat_df.values.astype(np.float32))
             y_pred = float(np.expm1(y_log_pred[0])) if np.isscalar(y_log_pred[0]) or len(np.atleast_1d(y_log_pred))>0 else float(np.expm1(y_log_pred))
         except Exception:
             y_pred = float(hist.tail(3).mean() if len(hist)>=3 else hist.mean())
@@ -398,26 +442,20 @@ def train_xgb_on_series(s: pd.Series, steps: int = 5, conservative_factor: float
         preds.append(y_pred)
         hist.loc[next_date] = y_pred
 
-    return preds, float(val_smape) if not np.isnan(val_smape) else np.nan
+    return preds, float(val_sm) if not np.isnan(val_sm) else np.nan
 
-def smape(y_true, y_pred):
-    y_true = np.array(y_true, dtype=float)
-    y_pred = np.array(y_pred, dtype=float)
-    denom = (np.abs(y_true) + np.abs(y_pred) + 1e-9)
-    return np.mean(2.0 * np.abs(y_pred - y_true) / denom) * 100
-
-# ----------------- UI Flow ----------------
+# ----------------- UI ----------------
 st.title("Primas & Siniestros — Forecast (Aug–Dec 2025)")
+st.markdown("Carga la Google Sheet (pública) o sube un archivo. Usa la herramienta de diagnóstico si las sumas no coinciden.")
 
+# Sidebar: data source
 st.sidebar.header("Origen de datos")
-st.sidebar.markdown("La app intentará cargar automáticamente desde la Google Sheet que proporcionaste.")
-sheet_url = st.sidebar.text_input("Google Sheet URL (o Sheet ID)", value=DEFAULT_SHEET_URL_1)
+sheet_url = st.sidebar.text_input("Google Sheet URL o Sheet ID", value=DEFAULT_SHEET_URL)
 gid_input = st.sidebar.text_input("GID (opcional)", value=DEFAULT_GID)
 if st.sidebar.button("Forzar recarga desde Google Sheets"):
     st.cache_data.clear()
     st.experimental_rerun()
 
-# Try automatic load on start
 df_raw = pd.DataFrame()
 load_error = None
 try:
@@ -425,25 +463,24 @@ try:
     df_candidate = try_load_public_sheet(sheet_input=sheet_url, gid=extracted_gid)
     if not df_candidate.empty:
         df_raw = df_candidate
-        st.sidebar.success("Google Sheet cargada correctamente (pública).")
+        st.sidebar.success("Google Sheet cargada correctamente.")
 except Exception as e:
     load_error = e
     st.sidebar.warning("No se pudo cargar automáticamente la Google Sheet pública. Puedes subir el archivo manualmente.")
-    st.sidebar.text(str(e)[:300])
+    st.sidebar.text(str(e)[:400])
 
-# Manual upload fallback
 st.sidebar.markdown("---")
-st.sidebar.markdown("O sube un archivo si la Sheet no está pública")
+st.sidebar.markdown("O sube un archivo")
 uploaded_csv = st.sidebar.file_uploader("Subir CSV", type=["csv"])
 uploaded_xlsx = st.sidebar.file_uploader("Subir Excel (.xlsx)", type=["xlsx"])
-if uploaded_csv is not None:
+if uploaded_csv:
     try:
         df_raw = pd.read_csv(StringIO(uploaded_csv.getvalue().decode("utf-8")))
         st.sidebar.success("CSV cargado.")
     except Exception as e:
         st.sidebar.error("Error leyendo CSV.")
         st.sidebar.exception(e)
-if uploaded_xlsx is not None:
+if uploaded_xlsx:
     try:
         df_raw = pd.read_excel(BytesIO(uploaded_xlsx.getvalue()))
         st.sidebar.success("Excel cargado.")
@@ -451,9 +488,8 @@ if uploaded_xlsx is not None:
         st.sidebar.error("Error leyendo Excel.")
         st.sidebar.exception(e)
 
-# Option: use sample data
 if df_raw.empty:
-    if st.sidebar.button("Usar datos de ejemplo (temporal)"):
+    if st.sidebar.button("Usar datos de ejemplo"):
         dates = pd.date_range(start='2020-01-01', end='2025-07-01', freq='MS')
         data = []
         comps = ['ESTADO','MAPFRE','LIBERTY']
@@ -473,34 +509,31 @@ if df_raw.empty:
     st.warning("No hay datos cargados. Carga la Google Sheet pública o sube un archivo.")
     st.stop()
 
-# Debug preview of raw columns
-st.sidebar.markdown("### Columnas detectadas (crudas)")
+# show raw columns and sample
+st.sidebar.markdown("### Columnas crudas detectadas")
 st.sidebar.write(df_raw.columns.tolist())
 st.write("### Muestra cruda (primeras filas)")
-st.dataframe(df_raw.head(5))
+st.dataframe(df_raw.head(6))
 
 # Normalize
 try:
     df = normalize_input(df_raw)
 except Exception as e:
-    st.error("Error al normalizar los datos.")
+    st.error("Error al normalizar datos.")
     st.exception(e)
     st.stop()
 
-# Show normalized preview
 st.markdown("### Muestra normalizada (primeras filas)")
 st.dataframe(df.head(6))
 
-# ---------------- DIAGNÓSTICO (útil para tu caso) ----------------
+# Diagnostic UI
 st.sidebar.markdown("---")
-st.sidebar.markdown("### Diagnóstico de sumas por Ramo/Mes")
-diag_ramo = st.sidebar.text_input("Ramo a inspeccionar", value="SOAT")
+st.sidebar.markdown("### Diagnóstico rápido")
+diag_ramo = st.sidebar.text_input("Ramo a inspeccionar (diagnóstico)", value="SOAT")
 diag_tipo = st.sidebar.selectbox("Tipo", options=["Primas", "Siniestros"], index=0)
 diag_year = st.sidebar.number_input("Año", min_value=2000, max_value=2100, value=2021, step=1)
 diag_month = st.sidebar.selectbox("Mes (num)", options=list(range(1,13)), index=11)
-
 if st.sidebar.button("Ejecutar diagnóstico"):
-    # Use normalized df and raw df to show details
     df_diag = df.copy()
     mask_ramo = df_diag['RAMO'].str.upper().str.contains(diag_ramo.upper(), na=False)
     mask_tipo = df_diag['TIPO'].str.lower() == diag_tipo.lower()
@@ -511,21 +544,17 @@ if st.sidebar.button("Ejecutar diagnóstico"):
     if sel.empty:
         st.info("No se encontraron filas con esos filtros.")
     else:
-        # Show raw and parsed values
-        cols_show = ['FECHA','HOMO','COMPANIA','CIUDAD','RAMO','TIPO','VALOR_RAW','VALOR']
-        cols_show = [c for c in cols_show if c in sel.columns]
-        st.dataframe(sel[cols_show].sort_values(by='CIUDAD').head(500))
-        st.write("Suma VALOR (parsed):", sel['VALOR'].sum())
-        st.write("Suma VALOR_RAW (strings) - muestra unicos (hasta 50):")
-        raw_values = sel['VALOR_RAW'].astype(str).unique()[:50].tolist() if 'VALOR_RAW' in sel.columns else []
-        st.write(raw_values)
+        cols_show = [c for c in ['FECHA','HOMO','COMPANIA','CIUDAD','RAMO','TIPO','VALOR_RAW','VALOR'] if c in sel.columns]
+        st.dataframe(sel[cols_show].sort_values(by=['CIUDAD','FECHA']).head(500))
+        st.write("Suma VALOR (parsed):", float(sel['VALOR'].sum()))
+        st.write("Valores crudos ejemplo (hasta 50):")
+        st.write(sel['VALOR_RAW'].astype(str).unique()[:50].tolist())
         st.write("Filas con VALOR NaN:", int(sel['VALOR'].isna().sum()))
-        # Show sum by city
         if 'CIUDAD' in sel.columns:
-            st.write("Suma por CIUDAD (parsed):")
+            st.write("Suma por CIUDAD:")
             st.dataframe(sel.groupby('CIUDAD')['VALOR'].sum().sort_values(ascending=False).head(200))
 
-# ---------------- Filters ----------------
+# Filters
 st.sidebar.markdown("---")
 st.sidebar.header("Filtros para predicción")
 company_opts = ["TODAS"] + sorted(df['COMPANIA'].dropna().unique().tolist())
@@ -553,7 +582,7 @@ if df_f.empty:
 
 st.write(f"Registros después de filtros: {len(df_f):,} — Periodo: {df_f['FECHA'].min().date()} to {df_f['FECHA'].max().date()}")
 
-# Global plot for Primas/Siniestros
+# Global plot
 ts_pr = df_f[df_f['TIPO'].str.lower() == 'primas'].groupby('FECHA')['VALOR'].sum().sort_index()
 ts_si = df_f[df_f['TIPO'].str.lower() == 'siniestros'].groupby('FECHA')['VALOR'].sum().sort_index()
 
@@ -565,7 +594,7 @@ if not ts_si.empty:
 fig.update_layout(title="Serie histórica agregada", yaxis_title="Valor mensual (COP)", xaxis=dict(type="date", rangeslider=dict(visible=True)))
 st.plotly_chart(fig, use_container_width=True)
 
-# Group by HOMO x TIPO
+# Predictions by HOMO x TIPO
 st.markdown("## Predicciones por HOMOLOGACIÓN (Agosto-Diciembre 2025)")
 groups = df_f.groupby(['HOMO','TIPO'])
 
@@ -580,11 +609,11 @@ for (homo, tipo), g in groups:
     pbar.progress(int(idx/total*100))
     s = g.set_index('FECHA').sort_index().groupby('FECHA')['VALOR'].sum()
     s = s.asfreq("MS").fillna(0.0)
-    preds, val_smape = train_xgb_on_series(s, steps=len(TARGET_MONTHS), conservative_factor=conservative_factor)
+    preds, val_sm = train_xgb_on_series(s, steps=len(TARGET_MONTHS), conservative_factor=conservative_factor)
     row = {'HOMOLOGACIÓN': homo}
     for dt, p in zip(TARGET_MONTHS, preds):
         row[dt.strftime("%b-%Y")] = round(p, 0)
-    row['SMAPE_val'] = round(val_smape, 2) if not np.isnan(val_smape) else None
+    row['SMAPE_val'] = round(val_sm, 2) if not np.isnan(val_sm) else None
     if tipo.lower().startswith('p'):
         primas_rows.append(row)
     else:
@@ -607,7 +636,7 @@ if not sini_df.empty:
 else:
     st.info("No hay predicciones de siniestros.")
 
-# Aggregated by city
+# Aggregate by city
 st.markdown("### Agregado por CIUDAD — Predicción (Agosto-Diciembre 2025)")
 if not primas_df.empty:
     homo_city = df_f.groupby('HOMO')['CIUDAD'].agg(lambda s: s.mode().iat[0] if not s.mode().empty else "UNKNOWN")
@@ -620,7 +649,7 @@ if not sini_df.empty:
     agg_city_si = tmp.groupby('CIUDAD')[TARGET_MONTHS_STR].sum().round(0)
     st.dataframe(agg_city_si.style.format(lambda v: f"${int(v):,}".replace(",", ".")), use_container_width=True)
 
-# Download results
+# Download
 if (not primas_df.empty) or (not sini_df.empty):
     with BytesIO() as out:
         with pd.ExcelWriter(out, engine="openpyxl") as writer:
