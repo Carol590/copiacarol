@@ -35,7 +35,7 @@ st.set_page_config(page_title="Industria · Forecast 2026 por Ciudad / Ramo", la
 # ---------- Utilities ----------
 def export_csv_url(sheet_id: str, gid: str) -> str:
     """Genera URL de exportación correcta (SIN espacios)"""
-    return f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
+    return f"https://docs.google.com/spreadsheets/d/1VljNnZtRPDA3TkTUP6w8AviZCPIfILqe/edit?gid=293107109#gid=293107109"
 
 def parse_number_co(series: pd.Series) -> pd.Series:
     s = series.astype(str).fillna("")
