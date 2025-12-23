@@ -1,16 +1,19 @@
 streamlit
 pandas
 numpy
+plotly
+statsmodels
+scipy
+patsy
+openpyxl
 xgboost
 scikit-learn
-plotly
-gspread
-google-auth
-google-auth-oauthlib
-google-auth-httplib2
-openpyxl
-python-dateutil
-pytz
+
+
+
+
+
+
 
 
 
