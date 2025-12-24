@@ -2,14 +2,18 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
+from xgboost import XGBRegressor
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_absolute_error, r2_score
+import warnings
+warnings.filterwarnings('ignore')
 
-st.set_page_config(page_title="Promedio Mensual por Homologación", layout="wide")
+st.set_page_config(page_title="Predicción Primas/Siniestros", layout="wide")
 
 @st.cache_data(ttl=300)
 def cargar_datos():
     """Carga datos del Google Sheet"""
     url = "https://docs.google.com/spreadsheets/d/1VljNnZtRPDA3TkTUP6w8AviZCPIfILqe/export?format=csv&gid=293107109"
-    
     try:
         df = pd.read_csv(url)
         st.success(f"✅ {len(df):,} filas cargadas")
@@ -19,83 +23,76 @@ def cargar_datos():
         return pd.DataFrame()
 
 def preparar_datos(df):
-    """Prepara datos con Primas y Siniestros separados"""
+    """Prepara datos completos con filtros"""
     df.columns = df.columns.str.strip()
-    
-    # FECHA → YEAR, MONTH
+   
+    # FECHA
     if 'FECHA' in df.columns:
         df['FECHA'] = pd.to_datetime(df['FECHA'], dayfirst=True, errors='coerce')
         df['YEAR'] = df['FECHA'].dt.year
         df['MONTH'] = df['FECHA'].dt.month
-    else:
-        df['YEAR'] = 2023
-        df['MONTH'] = 1
-    
+   
     # Valor numérico
     if 'Valor_Mensual' in df.columns:
         df['Valor_Mensual'] = pd.to_numeric(df['Valor_Mensual'], errors='coerce').fillna(0)
-    
-    # SEPARAR PRIMAS vs SINIETROS
+   
+    # PRIMAS vs SINIETROS
     if 'Primas/Siniestros' in df.columns:
         df['Primas'] = np.where(df['Primas/Siniestros'] == 'Primas', df['Valor_Mensual'], 0)
         df['Siniestros'] = np.where(df['Primas/Siniestros'] == 'Siniestros', df['Valor_Mensual'], 0)
-    else:
-        df['Primas'] = df['Valor_Mensual']
-        df['Siniestros'] = 0
-    
-    # Homologación
-    if 'HOMOLOGACIÓN' in df.columns:
-        df['HOMOLOGACIÓN'] = df['HOMOLOGACIÓN'].astype(str).str.strip()
-    else:
-        df['HOMOLOGACIÓN'] = 'SIN_HOMOLOGACION'
-    
+   
+    # Columnas para filtros
+    for col in ['HOMOLOGACIÓN', 'CIUDAD', 'COMPAÑÍA']:
+        if col in df.columns:
+            df[col] = df[col].astype(str).str.strip()
+   
     return df.dropna(subset=['YEAR', 'MONTH'])
 
 def calcular_promedio_mensual(df):
-    """🎯 PROMEDIO del TOTAL mensual por Homologación (todos los años)"""
-    
-    # PASO 1: Total mensual POR AÑO y Homologación
-    mensual = (
-        df.groupby(['HOMOLOGACIÓN', 'YEAR', 'MONTH'], as_index=False)
-        .agg({
-            'Primas': 'sum',
-            'Siniestros': 'sum'
-        })
-        .round(0)
-    )
-    mensual.rename(columns={
-        'Primas': 'Total_Primas_mensual',
-        'Siniestros': 'Total_Siniestros_mensual'
-    }, inplace=True)
-    
-    # PASO 2: PROMEDIO de esos totales mensuales (todos los años)
-    promedio_mensual = (
-        mensual.groupby(['HOMOLOGACIÓN', 'MONTH'], as_index=False)
-        .agg({
-            'Total_Primas_mensual': 'mean',
-            'Total_Siniestros_mensual': 'mean'
-        })
-        .round(0)
-    )
-    
-    # NOMBRES FINALES
-    promedio_mensual.columns = [
-        'HOMOLOGACIÓN', 'Mes', 
-        'Promedio_Total_Primas', 'Promedio_Total_Siniestros'
-    ]
-    
-    # ORDENAR meses 1-12
-    promedio_mensual['Mes_Nombre'] = promedio_mensual['Mes'].map({
-        1: 'Enero', 2: 'Febrero', 3: 'Marzo', 4: 'Abril',
-        5: 'Mayo', 6: 'Junio', 7: 'Julio', 8: 'Agosto',
-        9: 'Septiembre', 10: 'Octubre', 11: 'Noviembre', 12: 'Diciembre'
-    })
-    
-    return promedio_mensual.sort_values(['HOMOLOGACIÓN', 'Mes'])
+    """Promedio total mensual por Homologación"""
+    mensual = df.groupby(['HOMOLOGACIÓN', 'YEAR', 'MONTH']).agg({
+        'Primas': 'sum', 'Siniestros': 'sum'
+    }).round(0)
+   
+    promedio_mensual = mensual.groupby(['HOMOLOGACIÓN', 'MONTH']).mean().round(0)
+    promedio_mensual.columns = ['Promedio_Total_Primas', 'Promedio_Total_Siniestros']
+    promedio_mensual = promedio_mensual.reset_index()
+   
+    # Nombres meses
+    mes_map = {1: 'Enero', 2: 'Febrero', 3: 'Marzo', 4: 'Abril', 5: 'Mayo', 6: 'Junio',
+               7: 'Julio', 8: 'Agosto', 9: 'Septiembre', 10: 'Octubre', 11: 'Noviembre', 12: 'Diciembre'}
+    promedio_mensual['Mes_Nombre'] = promedio_mensual['MONTH'].map(mes_map)
+   
+    return promedio_mensual.sort_values(['HOMOLOGACIÓN', 'MONTH'])
 
-# === APP PRINCIPAL ===
-st.title("📊 Promedio del Total Mensual por Homologación")
-st.markdown("**Promedio del total mensual de TODOS los años, por cada Homologación y Mes**")
+def entrenar_xgboost(df_filt, target_col):
+    """XGBoost para predecir meses futuros"""
+    features = ['MONTH', 'YEAR']
+    for col in ['HOMOLOGACIÓN', 'CIUDAD', 'COMPAÑÍA']:
+        if col in df_filt.columns:
+            df_filt[col] = pd.Categorical(df_filt[col]).codes
+            features.append(col)
+   
+    X = df_filt[features].fillna(0)
+    y = df_filt[target_col].fillna(0)
+   
+    if len(X) < 20:
+        return None, "Datos insuficientes"
+   
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+   
+    model = XGBRegressor(n_estimators=100, learning_rate=0.1, max_depth=4, random_state=42)
+    model.fit(X_train, y_train)
+   
+    y_pred = model.predict(X_test)
+    mae = mean_absolute_error(y_test, y_pred)
+    r2 = r2_score(y_test, y_pred)
+   
+    return model, {'mae': mae, 'r2': r2, 'features': features}
+
+# === APP ===
+st.title("🔮 Predicción Primas/Siniestros 2025")
+st.markdown("**XGBoost + Promedios Mensuales por Homologación**")
 
 # CARGAR DATOS
 df = cargar_datos()
@@ -103,107 +100,101 @@ if df.empty:
     st.stop()
 
 df_clean = preparar_datos(df)
-st.success(f"✅ Datos preparados: {len(df_clean):,} filas | {df_clean['YEAR'].min()}-{df_clean['YEAR'].max()}")
 
-# FILTROS
+# === FILTROS ===
 st.sidebar.header("🔍 Filtros")
-homologacion_opts = sorted(df_clean['HOMOLOGACIÓN'].unique())
-homologacion = st.sidebar.multiselect(
-    "Homologación", 
-    homologacion_opts, 
-    default=homologacion_opts[:5]  # Top 5 por defecto
-)
+homologacion_opts = sorted(df_clean['HOMOLOGACIÓN'].dropna().unique())
+ciudad_opts = sorted(df_clean['CIUDAD'].dropna().unique()) if 'CIUDAD' in df_clean else ['TODAS']
+compania_opts = sorted(df_clean['COMPAÑÍA'].dropna().unique()) if 'COMPAÑÍA' in df_clean else ['TODAS']
 
-df_filt = df_clean[df_clean['HOMOLOGACIÓN'].isin(homologacion)].copy()
+homologacion = st.sidebar.multiselect("Homologación", homologacion_opts, default=homologacion_opts[:3])
+ciudad = st.sidebar.multiselect("Ciudad", ciudad_opts, default=ciudad_opts[:3] if ciudad_opts != ['TODAS'] else ciudad_opts)
+compania = st.sidebar.multiselect("Compañía", compania_opts, default=compania_opts[:3] if compania_opts != ['TODAS'] else compania_opts)
 
-# === TABLA PRINCIPAL ===
-st.header("🎯 Promedio Total Mensual por Homologación")
+df_filt = df_clean.copy()
+if homologacion:
+    df_filt = df_filt[df_filt['HOMOLOGACIÓN'].isin(homologacion)]
+if ciudad != ['TODAS'] and ciudad:
+    df_filt = df_filt[df_filt['CIUDAD'].isin(ciudad)]
+if compania != ['TODAS'] and compania:
+    df_filt = df_filt[df_filt['COMPAÑÍA'].isin(compania)]
+
+# === MÉTRICAS GLOBALES AL INICIO ===
+st.header("📊 Métricas Globales")
 tabla_promedios = calcular_promedio_mensual(df_filt)
 
-st.dataframe(tabla_promedios, use_container_width=True, height=600)
+# Promedios generales
+promedio_primas_general = df_filt['Primas'].mean()
+promedio_sini_general = df_filt['Siniestros'].mean()
+total_primas_general = df_filt['Primas'].sum()
+total_sini_general = df_filt['Siniestros'].sum()
 
-# === GRÁFICO PRINCIPAL ===
-st.header("📈 Gráfico: Promedio Mensual por Homologación")
-fig_line = px.line(
-    tabla_promedios,
-    x='Mes_Nombre',
-    y=['Promedio_Total_Primas', 'Promedio_Total_Siniestros'],
-    color='HOMOLOGACIÓN',
-    title="Promedio del Total Mensual (todos los años)",
-    markers=True
-)
-fig_line.update_layout(height=500, xaxis_tickangle=-45)
-st.plotly_chart(fig_line, use_container_width=True)
-
-# === RESUMEN POR HOMOLOGACIÓN ===
-st.header("🏢 Resumen Anual Promedio por Homologación")
-resumen_homo = tabla_promedios.groupby('HOMOLOGACIÓN').agg({
-    'Promedio_Total_Primas': 'mean',
-    'Promedio_Total_Siniestros': 'mean'
-}).round(0)
-
-resumen_homo['Promedio_Total_General'] = (
-    resumen_homo['Promedio_Total_Primas'] + resumen_homo['Promedio_Total_Siniestros']
-)
-resumen_homo = resumen_homo.sort_values('Promedio_Total_General', ascending=False)
-st.dataframe(resumen_homo, use_container_width=True)
-
-# MÉTRICAS GLOBALES
 col1, col2, col3, col4 = st.columns(4)
-total_primas_prom = tabla_promedios['Promedio_Total_Primas'].sum()
-total_sini_prom = tabla_promedios['Promedio_Total_Siniestros'].sum()
-col1.metric("💰 Promedio Anual Primas", f"${total_primas_prom:,.0f}")
-col2.metric("💰 Promedio Anual Siniestros", f"${total_sini_prom:,.0f}")
+col1.metric("💰 Promedio Mensual Primas", f"${promedio_primas_general:,.0f}")
+col2.metric("💰 Promedio Mensual Siniestros", f"${promedio_sini_general:,.0f}")
 col3.metric("📈 Homologaciones", len(tabla_promedios['HOMOLOGACIÓN'].unique()))
-col4.metric("📅 Meses", tabla_promedios['Mes'].nunique())
+col4.metric("📅 Años", f"{df_filt['YEAR'].min()}-{df_filt['YEAR'].max()}")
 
-# === TOP 5 HOMOLOGACIONES ===
-st.header("🔥 Top 5 Homologaciones (Promedio Total Anual)")
-top_5 = resumen_homo.head(5)
-fig_bar = px.bar(
-    top_5.reset_index(),
-    x='HOMOLOGACIÓN',
-    y=['Promedio_Total_Primas', 'Promedio_Total_Siniestros'],
-    title="Top 5 Homologaciones por Promedio Anual",
-    barmode='group'
-)
-st.plotly_chart(fig_bar, use_container_width=True)
+# === XGBoost PREDICCIÓN AGOSTO-DEC 2025 ===
+st.header("🔮 Predicción XGBoost Agosto-Diciembre 2025")
+target = st.radio("Predecir", ["Primas", "Siniestros"])
 
-# === DETALLE CÁLCULO ===
-with st.expander("🔎 Cómo se calcula"):
-    st.markdown("""
-    **1. Total mensual por Año-Homologación**
-    ```
-    df.groupby(['HOMOLOGACIÓN', 'YEAR', 'MONTH'])['Primas'].sum()
-    ```
-    
-    **2. Promedio de esos totales (todos los años)**
-    ```
-    mensual.groupby(['HOMOLOGACIÓN', 'MONTH'])['Total_Primas'].mean()
-    ```
-    
-    **Resultado**: Para cada Homologación y Mes → promedio del total mensual de todos los años
-    """)
+if st.button("🚀 Entrenar y Predecir", type="primary"):
+    with st.spinner("Entrenando XGBoost..."):
+        model, results = entrenar_xgboost(df_filt, target)
+        if model:
+            st.session_state.model = model
+            st.session_state.results = results
+            st.session_state.target = target
+            st.success("✅ Modelo entrenado!")
+
+if 'model' in st.session_state:
+    # Crear datos futuros 2025: Agosto-Diciembre
+    meses_futuros = [8,9,10,11,12]
+    future_data = []
+   
+    for homolog in tabla_promedios['HOMOLOGACIÓN'].unique():
+        for mes in meses_futuros:
+            row = {'YEAR': 2025, 'MONTH': mes, 'HOMOLOGACIÓN': homolog}
+            # Features más frecuentes para CIUDAD/COMPAÑÍA
+            if 'CIUDAD' in df_filt.columns:
+                row['CIUDAD'] = df_filt['CIUDAD'].mode()[0] if len(df_filt) > 0 else 0
+            if 'COMPAÑÍA' in df_filt.columns:
+                row['COMPAÑÍA'] = df_filt['COMPAÑÍA'].mode()[0] if len(df_filt) > 0 else 0
+            future_data.append(row)
+   
+    future_df = pd.DataFrame(future_data)
+   
+    # Encoding igual que entrenamiento
+    for col in ['HOMOLOGACIÓN', 'CIUDAD', 'COMPAÑÍA']:
+        if col in future_df.columns:
+            future_df[col] = pd.Categorical(future_df[col], categories=df_filt[col].cat.categories).codes
+   
+    future_df = future_df.fillna(0)[st.session_state.results['features']]
+    predicciones = st.session_state.model.predict(future_df)
+   
+    # Tabla predicciones
+    pred_df = future_df.copy()
+    pred_df['Mes_Nombre'] = pred_df['MONTH'].map({8: 'Agosto', 9: 'Septiembre', 10: 'Octubre', 11: 'Noviembre', 12: 'Diciembre'})
+    pred_df['Predicción'] = predicciones.round(0)
+    pred_tabla = pred_df.groupby(['HOMOLOGACIÓN', 'Mes_Nombre'])['Predicción'].sum().reset_index()
+   
+    st.subheader("📈 Predicciones 2025 (Agosto-Diciembre)")
+    st.dataframe(pred_tabla.pivot(index='HOMOLOGACIÓN', columns='Mes_Nombre', values='Predicción').fillna(0).round(0), use_container_width=True)
+   
+    # Métricas modelo
+    col1, col2 = st.columns(2)
+    col1.metric("MAE", f"${st.session_state.results['mae']:,.0f}")
+    col2.metric("R²", f"{st.session_state.results['r2']:.1%}")
+
+# === TABLA PROMEDIOS MENSUALES ===
+st.header("📊 Promedio Total Mensual por Homologación")
+st.dataframe(tabla_promedios.pivot(index='HOMOLOGACIÓN', columns='Mes_Nombre', values='Promedio_Total_Primas').fillna(0).round(0), use_container_width=True)
+
+# Gráfico
+fig = px.line(tabla_promedios, x='Mes_Nombre', y='Promedio_Total_Primas', color='HOMOLOGACIÓN', markers=True)
+st.plotly_chart(fig, use_container_width=True)
 
 # === DESCARGAS ===
-st.header("📥 Descargas")
-col_dl1, col_dl2 = st.columns(2)
-with col_dl1:
-    csv_principal = tabla_promedios.to_csv(index=False).encode('utf-8')
-    st.download_button(
-        label="📊 Tabla Principal CSV",
-        data=csv_principal,
-        file_name=f"promedio_mensual_homologacion_{pd.Timestamp.now().strftime('%Y%m%d')}.csv",
-        mime='text/csv'
-    )
-with col_dl2:
-    excel_data = tabla_promedios.to_excel(index=False)
-    st.download_button(
-        label="📊 Tabla Principal Excel",
-        data=excel_data,
-        file_name=f"promedio_mensual_homologacion_{pd.Timestamp.now().strftime('%Y%m%d')}.xlsx",
-        mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-    )
-
-st.markdown("---")
-st.caption("✅ **PROMEDIO del TOTAL mensual por Homologación (todos los años)**")
+csv = tabla_promedios.to_csv(index=False).encode('utf-8')
+st.download_button("📥 Descargar CSV", csv, f"predicciones_{pd.Timestamp.now().strftime('%Y%m%d')}.csv")
