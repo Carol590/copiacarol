@@ -66,18 +66,22 @@ def calcular_promedio_mensual(df):
     return promedio_mensual.sort_values(['HOMOLOGACIÓN', 'MONTH'])
 
 def encode_categorical(df, cols):
-    """✅ Encoding SEGURO sin .cat accessor"""
+    """Encoding SEGURO con diccionario reversible"""
     encoders = {}
+    reverse_encoders = {}
+    
     for col in cols:
         if col in df.columns:
             df[col] = df[col].astype(str)
             unique_vals = sorted(df[col].unique())
             encoders[col] = {val: i for i, val in enumerate(unique_vals)}
+            reverse_encoders[col] = {i: val for val, i in encoders[col].items()}
             df[col] = df[col].map(encoders[col]).fillna(0).astype(int)
-    return df, encoders
+    
+    return df, encoders, reverse_encoders
 
 def entrenar_xgboost(df_filt, target_col):
-    """✅ XGBoost FIX - Encoding manual"""
+    """XGBoost con encoding reversible"""
     features = ['MONTH', 'YEAR']
     cat_cols = []
     for col in ['HOMOLOGACIÓN', 'CIUDAD', 'COMPAÑÍA']:
@@ -85,12 +89,11 @@ def entrenar_xgboost(df_filt, target_col):
             features.append(col)
             cat_cols.append(col)
     
-    # ✅ ENCODING MANUAL (sin .cat accessor)
-    X, encoders = encode_categorical(df_filt[features].copy(), cat_cols)
+    X, encoders, reverse_encoders = encode_categorical(df_filt[features].copy(), cat_cols)
     y = df_filt[target_col].fillna(0)
     
     if len(X) < 20:
-        return None, "Datos insuficientes"
+        return None, "Datos insuficientes", None, None
     
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
     
@@ -101,33 +104,51 @@ def entrenar_xgboost(df_filt, target_col):
     mae = mean_absolute_error(y_test, y_pred)
     r2 = r2_score(y_test, y_pred)
     
-    return model, {'mae': mae, 'r2': r2, 'features': features, 'encoders': encoders}
+    return model, {'mae': mae, 'r2': r2, 'features': features}, encoders, reverse_encoders
 
-def preparar_datos_futuros(tabla_promedios, encoders, target):
-    """✅ Datos futuros con encoding correcto"""
+def preparar_predicciones_con_nombres(model, tabla_promedios, encoders, reverse_encoders, features):
+    """✅ Predicciones con NOMBRES de Homologación"""
     meses_futuros = [8,9,10,11,12]
     future_data = []
     
-    for homolog in tabla_promedios['HOMOLOGACIÓN'].unique():
-        for mes in meses_futuros:
-            row = {'YEAR': 2025, 'MONTH': mes}
-            
-            # Encoding MANUAL igual que entrenamiento
-            row['HOMOLOGACIÓN'] = encoders['HOMOLOGACIÓN'].get(homolog, 0)
-            
-            # Encoding por defecto para CIUDAD/COMPAÑÍA
-            for col in ['CIUDAD', 'COMPAÑÍA']:
-                if col in encoders:
-                    row[col] = list(encoders[col].values())[0] if encoders[col] else 0
-            
-            future_data.append(row)
+    # Diccionario para mapear números → nombres
+    homolog_map = reverse_encoders.get('HOMOLOGACIÓN', {})
+    
+    for homolog_num, homolog_nombre in homolog_map.items():
+        if homolog_nombre in tabla_promedios['HOMOLOGACIÓN'].values:
+            for mes in meses_futuros:
+                row = {'YEAR': 2025, 'MONTH': mes, 'HOMOLOGACIÓN': int(homolog_num)}
+                
+                # Encoding para otras categorías (usar primera categoría)
+                for col in ['CIUDAD', 'COMPAÑÍA']:
+                    if col in encoders and encoders[col]:
+                        row[col] = 0  # Primera categoría
+                
+                future_data.append(row)
     
     future_df = pd.DataFrame(future_data)
-    return future_df
+    
+    # Asegurar columnas
+    for col in features:
+        if col not in future_df.columns:
+            future_df[col] = 0
+    
+    future_df = future_df[features]
+    predicciones = model.predict(future_df)
+    
+    # ✅ AGREGAR NOMBRES de Homologación
+    future_df['HOMOLOGACIÓN_NOMBRE'] = future_df['HOMOLOGACIÓN'].map(homolog_map)
+    future_df['Mes_Nombre'] = future_df['MONTH'].map({8: 'Agosto', 9: 'Septiembre', 10: 'Octubre', 11: 'Noviembre', 12: 'Diciembre'})
+    future_df['Predicción'] = predicciones.round(0)
+    
+    # Agrupar por Homologación y Mes
+    pred_tabla = future_df.groupby(['HOMOLOGACIÓN_NOMBRE', 'Mes_Nombre'])['Predicción'].sum().reset_index()
+    
+    return pred_tabla
 
 # === APP ===
 st.title("🔮 Predicción Primas/Siniestros 2025")
-st.markdown("**✅ FIX: XGBoost Agosto-Diciembre 2025**")
+st.markdown("**✅ Nombres Homologación en Predicciones**")
 
 # CARGAR DATOS
 df = cargar_datos()
@@ -154,11 +175,10 @@ if ciudad != ['TODAS'] and ciudad:
 if compania != ['TODAS'] and compania:
     df_filt = df_filt[df_filt['COMPAÑÍA'].isin(compania)]
 
-# === MÉTRICAS GLOBALES AL INICIO ===
+# === MÉTRICAS GLOBALES ===
 st.header("📊 Métricas Globales")
 tabla_promedios = calcular_promedio_mensual(df_filt)
 
-# Promedios generales
 promedio_primas_general = df_filt['Primas'].mean()
 promedio_sini_general = df_filt['Siniestros'].mean()
 
@@ -168,16 +188,18 @@ col2.metric("💰 Promedio Mensual Siniestros", f"${promedio_sini_general:,.0f}"
 col3.metric("📈 Homologaciones", len(tabla_promedios['HOMOLOGACIÓN'].unique()))
 col4.metric("📅 Años", f"{df_filt['YEAR'].min()}-{df_filt['YEAR'].max()}")
 
-# === XGBoost PREDICCIÓN AGOSTO-DEC 2025 ===
+# === XGBoost ===
 st.header("🔮 Predicción XGBoost Agosto-Diciembre 2025")
 target = st.radio("Predecir", ["Primas", "Siniestros"])
 
 if st.button("🚀 Entrenar y Predecir", type="primary", use_container_width=True):
     with st.spinner("Entrenando XGBoost..."):
-        model, results = entrenar_xgboost(df_filt, target)
+        model, results, encoders, reverse_encoders = entrenar_xgboost(df_filt, target)
         if model:
             st.session_state.model = model
             st.session_state.results = results
+            st.session_state.encoders = encoders
+            st.session_state.reverse_encoders = reverse_encoders
             st.session_state.target = target
             st.session_state.tabla_promedios = tabla_promedios
             st.success("✅ Modelo entrenado!")
@@ -186,46 +208,32 @@ if st.button("🚀 Entrenar y Predecir", type="primary", use_container_width=Tru
 if 'model' in st.session_state:
     st.subheader("📈 Predicciones 2025 (Agosto-Diciembre)")
     
-    # ✅ FIX: Datos futuros con encoding correcto
-    future_df = preparar_datos_futuros(
-        st.session_state.tabla_promedios, 
-        st.session_state.results['encoders'], 
-        st.session_state.target
+    # ✅ NOMBRES REALES de Homologación
+    pred_tabla = preparar_predicciones_con_nombres(
+        st.session_state.model,
+        st.session_state.tabla_promedios,
+        st.session_state.encoders,
+        st.session_state.reverse_encoders,
+        st.session_state.results['features']
     )
     
-    # Asegurar columnas exactas
-    for col in st.session_state.results['features']:
-        if col not in future_df.columns:
-            future_df[col] = 0
-    
-    future_df = future_df[st.session_state.results['features']]
-    predicciones = st.session_state.model.predict(future_df)
-    
-    # Crear tabla pivot
-    future_df['Mes_Nombre'] = future_df['MONTH'].map({8: 'Agosto', 9: 'Septiembre', 10: 'Octubre', 11: 'Noviembre', 12: 'Diciembre'})
-    future_df['Predicción'] = predicciones.round(0)
-    
-    pred_tabla = future_df.groupby(['HOMOLOGACIÓN', 'Mes_Nombre'])['Predicción'].sum().reset_index()
-    
-    # ✅ PIVOT: Filas=Homologación, Columnas=Meses
-    pivot_pred = pred_tabla.pivot(index='HOMOLOGACIÓN', columns='Mes_Nombre', values='Predicción').fillna(0).round(0)
+    # PIVOT con NOMBRES
+    pivot_pred = pred_tabla.pivot(index='HOMOLOGACIÓN_NOMBRE', columns='Mes_Nombre', values='Predicción').fillna(0).round(0)
     st.dataframe(pivot_pred, use_container_width=True)
     
-    # Métricas modelo
+    # Métricas
     col1, col2 = st.columns(2)
     col1.metric("✅ MAE", f"${st.session_state.results['mae']:,.0f}")
     col2.metric("✅ R²", f"{st.session_state.results['r2']:.1%}")
 
-# === TABLA PROMEDIOS MENSUALES ===
+# === PROMEDIOS ===
 st.header("📊 Promedio Total Mensual por Homologación")
 pivot_promedios = tabla_promedios.pivot(index='HOMOLOGACIÓN', columns='Mes_Nombre', values='Promedio_Total_Primas').fillna(0).round(0)
 st.dataframe(pivot_promedios, use_container_width=True)
 
-# Gráfico
 fig = px.line(tabla_promedios, x='Mes_Nombre', y='Promedio_Total_Primas', color='HOMOLOGACIÓN', markers=True)
-fig.update_layout(height=500, xaxis_tickangle=-45)
 st.plotly_chart(fig, use_container_width=True)
 
-# === DESCARGAS ===
+# DESCARGA
 csv = tabla_promedios.to_csv(index=False).encode('utf-8')
 st.download_button("📥 Descargar CSV", csv, f"predicciones_{pd.Timestamp.now().strftime('%Y%m%d')}.csv")
