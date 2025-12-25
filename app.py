@@ -42,9 +42,9 @@ def preparar_datos(df):
     
     return df.dropna(subset=['YEAR', 'MONTH'])
 
-def sarima_por_homologacion(df_filt, homologacion, target_col, steps=5):
-    """SARIMA ORIGINAL - FUNCIONAL"""
-    mask = df_filt['HOMOLOGACIÓN'] == homologacion
+def sarima_por_grupo(df_filt, grupo_col, grupo_valor, target_col, steps=5):
+    """SARIMA genérico por cualquier columna de grupo"""
+    mask = df_filt[grupo_col] == grupo_valor
     if mask.sum() < 12:
         return np.full(steps, df_filt.loc[mask, target_col].mean())
     
@@ -63,11 +63,28 @@ def calcular_sarima_completo(df_filt, target, steps=5):
     homologaciones = df_filt['HOMOLOGACIÓN'].unique()
     
     for homologacion in homologaciones:
-        pred = sarima_por_homologacion(df_filt, homologacion, target, steps)
+        pred = sarima_por_grupo(df_filt, 'HOMOLOGACIÓN', homologacion, target, steps)
         
         for i, mes in enumerate([8,9,10,11,12]):
             resultados.append({
                 'HOMOLOGACIÓN': homologacion,
+                'Mes_Nombre': ['Agosto','Septiembre','Octubre','Noviembre','Diciembre'][i],
+                'Predicción': pred[i]
+            })
+    
+    return pd.DataFrame(resultados)
+
+def calcular_sarima_compania(df_filt, target_col='Primas', steps=5):
+    """🎯 SARIMA por COMPAÑÍA"""
+    resultados = []
+    companias = df_filt['COMPAÑÍA'].unique()
+    
+    for compania in companias:
+        pred = sarima_por_grupo(df_filt, 'COMPAÑÍA', compania, target_col, steps)
+        
+        for i, mes in enumerate([8,9,10,11,12]):
+            resultados.append({
+                'COMPAÑÍA': compania,
                 'Mes_Nombre': ['Agosto','Septiembre','Octubre','Noviembre','Diciembre'][i],
                 'Predicción': pred[i]
             })
@@ -89,27 +106,9 @@ def calcular_promedio_mensual(df):
     
     return promedio_mensual.sort_values(['HOMOLOGACIÓN', 'MONTH'])
 
-# 🎯 MODIFICADA: Ahora hace SARIMA por HOMOLOGACIÓN en lugar de promedios por compañía
-def calcular_sarima_homologacion(df):
-    """SARIMA por HOMOLOGACIÓN (Agosto-Diciembre 2025)"""
-    resultados = []
-    homologaciones = df['HOMOLOGACIÓN'].unique()
-    
-    for homologacion in homologaciones:
-        pred = sarima_por_homologacion(df, homologacion, 'Primas', steps=5)
-        
-        for i, mes in enumerate([8,9,10,11,12]):
-            resultados.append({
-                'HOMOLOGACIÓN': homologacion,
-                'Mes_Nombre': ['Agosto','Septiembre','Octubre','Noviembre','Diciembre'][i],
-                'Predicción_Primas': pred[i]
-            })
-    
-    return pd.DataFrame(resultados)
-
 # === APP PRINCIPAL ===
 st.title("🔥 SARIMA Predicción 2025")
-st.markdown("**SARIMA ORIGINAL + SARIMA por HOMOLOGACIÓN**")
+st.markdown("**SARIMA por Homologación + SARIMA por COMPAÑÍA**")
 
 df = cargar_datos()
 if df.empty:
@@ -117,7 +116,7 @@ if df.empty:
 
 df_clean = preparar_datos(df)
 
-# === FILTROS SIMPLES ===
+# === FILTROS ===
 st.sidebar.header("🔍 Filtros")
 homologacion_opts = sorted(df_clean['HOMOLOGACIÓN'].dropna().unique())
 homologacion = st.sidebar.multiselect("Homologación", homologacion_opts, default=homologacion_opts[:5])
@@ -132,41 +131,44 @@ col1, col2, col3, col4 = st.columns(4)
 col1.metric("💰 Promedio Primas", f"${df_filt['Primas'].mean():,.0f}")
 col2.metric("💰 Promedio Siniestros", f"${df_filt['Siniestros'].mean():,.0f}")
 col3.metric("📈 Homologaciones", len(tabla_promedios['HOMOLOGACIÓN'].unique()))
-col4.metric("📅 Años", f"{df_filt['YEAR'].min()}-{df_filt['YEAR'].max()}")
+col4.metric("🏢 Compañías", df_filt['COMPAÑÍA'].nunique())
 
-# === SARIMA ORIGINAL ===
-st.header("🔮 SARIMA Predicción Agosto-Diciembre 2025")
+# === SARIMA ORIGINAL (Homologación) ===
+st.header("🔮 SARIMA por HOMOLOGACIÓN")
 target = st.radio("Predecir", ["Primas", "Siniestros"], horizontal=True)
 
-if st.button("🚀 Generar SARIMA", type="primary", use_container_width=True):
+if st.button("🚀 Generar SARIMA Homologación", type="primary", use_container_width=True):
     with st.spinner("Entrenando SARIMA..."):
         st.session_state.pred_sarima = calcular_sarima_completo(df_filt, target)
         st.session_state.target = target
         st.session_state.df_filt = df_filt
-        st.success("✅ SARIMA listo!")
+        st.success("✅ SARIMA Homologación listo!")
 
 if 'pred_sarima' in st.session_state:
-    st.subheader("📈 Predicciones SARIMA 2025")
-    
+    st.subheader("📈 Predicciones Agosto-Diciembre 2025")
     pivot_sarima = st.session_state.pred_sarima.pivot(
         index='HOMOLOGACIÓN', 
         columns='Mes_Nombre', 
         values='Predicción'
     ).fillna(0).round(0)
-    
     st.dataframe(pivot_sarima, use_container_width=True)
 
-# === 🎯 NUEVA SECCIÓN: SARIMA POR HOMOLOGACIÓN ===
-st.header("🏢 SARIMA por HOMOLOGACIÓN (Agosto-Diciembre 2025)")
-tabla_sarima_homologacion = calcular_sarima_homologacion(df_filt)
+# === 🎯 SARIMA POR COMPAÑÍA ===
+st.header("🏢 SARIMA por COMPAÑÍA (Agosto-Diciembre 2025)")
+target_compania = st.radio("Predecir por Compañía", ["Primas", "Siniestros"], horizontal=True, key="compania_target")
 
-pivot_sarima_hom = tabla_sarima_homologacion.pivot(
-    index='HOMOLOGACIÓN', 
-    columns='Mes_Nombre', 
-    values='Predicción_Primas'
-).fillna(0).round(0)
+if st.button("🚀 Generar SARIMA Compañía", type="secondary", use_container_width=True):
+    with st.spinner("Entrenando SARIMA por Compañía..."):
+        st.session_state.pred_compania = calcular_sarima_compania(df_filt, target_compania)
+        st.success("✅ SARIMA Compañía listo!")
 
-st.dataframe(pivot_sarima_hom, use_container_width=True)
+if 'pred_compania' in st.session_state:
+    pivot_compania = st.session_state.pred_compania.pivot(
+        index='COMPAÑÍA', 
+        columns='Mes_Nombre', 
+        values='Predicción'
+    ).fillna(0).round(0)
+    st.dataframe(pivot_compania, use_container_width=True)
 
 # === PROMEDIOS HISTÓRICOS HOMOLOGACIÓN ===
 st.header("📊 Promedios Históricos Homologación")
@@ -184,7 +186,7 @@ if 'pred_sarima' in st.session_state:
         x='Mes_Nombre', 
         y='Predicción',
         color='HOMOLOGACIÓN',
-        title="SARIMA Predicciones Agosto-Diciembre 2025",
+        title="SARIMA Predicciones Homologación 2025",
         markers=True
     )
     st.plotly_chart(fig, use_container_width=True)
