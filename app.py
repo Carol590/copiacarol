@@ -108,4 +108,88 @@ with tab1:
     target = st.radio("Predecir", ["Primas", "Siniestros"], horizontal=True, key="homologacion")
     
     if st.button("🚀 Generar SARIMA Homologación", type="primary", use_container_width=True, key="btn_homologacion"):
-        with st.spinner("Entrenando
+        with st.spinner("Entrenando SARIMA..."):
+            st.session_state.pred_sarima = calcular_sarima_homologacion(df_clean, target)
+            st.session_state.target = target
+            st.success("✅ SARIMA Homologación listo!")
+
+    if 'pred_sarima' in st.session_state:
+        st.subheader("📈 Predicciones Agosto-Diciembre 2025")
+        pivot_sarima = st.session_state.pred_sarima.pivot(
+            index='HOMOLOGACIÓN', 
+            columns='Mes_Nombre', 
+            values='Predicción'
+        ).fillna(0).round(0)
+        st.dataframe(pivot_sarima, use_container_width=True)
+
+        fig = px.line(
+            st.session_state.pred_sarima, 
+            x='Mes_Nombre', 
+            y='Predicción',
+            color='HOMOLOGACIÓN',
+            title="SARIMA Predicciones Homologación 2025",
+            markers=True
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+# === TAB 2: AUTOMÓVILES ===
+with tab2:
+    df_auto = df_clean[df_clean['HOMOLOGACIÓN'] == 'AUTOMOVILES']
+    st.header("🚗 SARIMA por COMPAÑÍA - AUTOMÓVILES")
+    st.info(f"📊 Datos: {len(df_auto):,} filas")
+    
+    target_auto = st.radio("Predecir", ["Primas", "Siniestros"], horizontal=True, key="auto")
+    
+    if st.button("🚀 Generar SARIMA AUTOMÓVILES", type="primary", use_container_width=True, key="btn_auto"):
+        with st.spinner("Entrenando SARIMA AUTOMÓVILES..."):
+            st.session_state.pred_auto = calcular_sarima_compania(df_auto, target_auto)
+            st.success("✅ SARIMA AUTOMÓVILES listo!")
+    
+    if 'pred_auto' in st.session_state:
+        pivot_auto = st.session_state.pred_auto.pivot(
+            index='COMPAÑÍA', 
+            columns='Mes_Nombre', 
+            values='Predicción'
+        ).fillna(0).round(0)
+        st.dataframe(pivot_auto, use_container_width=True)
+
+# === TAB 3: CUMPLIMIENTO ===
+with tab3:
+    df_cumpl = df_clean[df_clean['HOMOLOGACIÓN'] == 'CUMPLIMIENTO']
+    st.header("✅ SARIMA por COMPAÑÍA - CUMPLIMIENTO")
+    st.info(f"📊 Datos: {len(df_cumpl):,} filas")
+    
+    target_cumpl = st.radio("Predecir", ["Primas", "Siniestros"], horizontal=True, key="cumpl")
+    
+    if st.button("🚀 Generar SARIMA CUMPLIMIENTO", type="primary", use_container_width=True, key="btn_cumpl"):
+        with st.spinner("Entrenando SARIMA CUMPLIMIENTO..."):
+            st.session_state.pred_cumpl = calcular_sarima_compania(df_cumpl, target_cumpl)
+            st.success("✅ SARIMA CUMPLIMIENTO listo!")
+    
+    if 'pred_cumpl' in st.session_state:
+        pivot_cumpl = st.session_state.pred_cumpl.pivot(
+            index='COMPAÑÍA', 
+            columns='Mes_Nombre', 
+            values='Predicción'
+        ).fillna(0).round(0)
+        st.dataframe(pivot_cumpl, use_container_width=True)
+
+# === TAB 4: GENERALES ===
+with tab4:
+    df_gen = df_clean[df_clean['HOMOLOGACIÓN'] == 'GENERALES']
+    st.header("🏢 SARIMA por COMPAÑÍA - GENERALES")
+    st.info(f"📊 Datos: {len(df_gen):,} filas")
+    
+    target_gen = st.radio("Predecir", ["Primas", "Siniestros"], horizontal=True, key="gen")
+    
+    if st.button("🚀 Generar SARIMA GENERALES", type="primary", use_container_width=True, key="btn_gen"):
+        with st.spinner("Entrenando SARIMA GENERALES..."):
+            st.session_state.pred_gen = calcular_sarima_compania(df_gen, target_gen)
+            st.success("✅ SARIMA GENERALES listo!")
+    
+    if 'pred_gen' in st.session_state:
+        pivot_gen = st.session_state.pred_gen.pivot(
+            index='COMPAÑÍA', 
+            columns='Mes_Nombre', 
+            values='Predicción'
+        ).fillna(0).
