@@ -1,4 +1,4 @@
-import streamlit as st
+ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
@@ -192,4 +192,11 @@ with tab4:
             index='COMPAÑÍA', 
             columns='Mes_Nombre', 
             values='Predicción'
-        ).fillna(0).
+        ).fillna(0).round(0)
+        st.dataframe(pivot_gen, use_container_width=True)
+
+# === TAB 5: RC ===
+with tab5:
+    df_rc = df_clean[df_clean['HOMOLOGACIÓN'] == 'RC']
+    st.header("
+
