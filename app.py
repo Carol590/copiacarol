@@ -59,6 +59,7 @@ def sarima_por_grupo(df_filt, grupo_col, grupo_valor, target_col, steps=5):
         return np.full(steps, series.tail(6).mean())
 
 def calcular_sarima_completo(df_filt, target, steps=5):
+    """SARIMA por HOMOLOGACIÓN"""
     resultados = []
     homologaciones = df_filt['HOMOLOGACIÓN'].unique()
     
@@ -74,22 +75,33 @@ def calcular_sarima_completo(df_filt, target, steps=5):
     
     return pd.DataFrame(resultados)
 
-def calcular_sarima_compania(df_filt, target_col='Primas', steps=5):
-    """🎯 SARIMA por COMPAÑÍA"""
+def calcular_sarima_compania_completo(df_filt, target_col='Primas', steps=5):
+    """🔥 SARIMA por COMPAÑÍA × HOMOLOGACIÓN (combinación única)"""
     resultados = []
-    companias = df_filt['COMPAÑÍA'].unique()
     
-    for compania in companias:
+    # 🎯 SARIMA por cada COMPAÑÍA × HOMOLOGACIÓN
+    for (compania, homologacion), group in df_filt.groupby(['COMPAÑÍA', 'HOMOLOGACIÓN']):
+        if len(group) < 12:  # Salta grupos con pocos datos
+            continue
+            
         pred = sarima_por_grupo(df_filt, 'COMPAÑÍA', compania, target_col, steps)
         
         for i, mes in enumerate([8,9,10,11,12]):
             resultados.append({
                 'COMPAÑÍA': compania,
+                'HOMOLOGACIÓN': homologacion,
                 'Mes_Nombre': ['Agosto','Septiembre','Octubre','Noviembre','Diciembre'][i],
                 'Predicción': pred[i]
             })
     
-    return pd.DataFrame(resultados)
+    df_result = pd.DataFrame(resultados)
+    
+    # 📊 Agregar TOTAL por COMPAÑÍA (suma de todas sus homologaciones)
+    total_companias = df_result.groupby(['COMPAÑÍA', 'Mes_Nombre'])['Predicción'].sum().reset_index()
+    total_companias['HOMOLOGACIÓN'] = 'TODOS LOS RAMOS'
+    
+    # Combinar individuales + total
+    return pd.concat([df_result, total_companias], ignore_index=True)
 
 def calcular_promedio_mensual(df):
     mensual = df.groupby(['HOMOLOGACIÓN', 'YEAR', 'MONTH']).agg({
@@ -108,7 +120,7 @@ def calcular_promedio_mensual(df):
 
 # === APP PRINCIPAL ===
 st.title("🔥 SARIMA Predicción 2025")
-st.markdown("**SARIMA por Homologación + SARIMA por COMPAÑÍA**")
+st.markdown("**SARIMA por Homologación + SARIMA por COMPAÑÍA (con Totales)**")
 
 df = cargar_datos()
 if df.empty:
@@ -153,20 +165,22 @@ if 'pred_sarima' in st.session_state:
     ).fillna(0).round(0)
     st.dataframe(pivot_sarima, use_container_width=True)
 
-# === 🎯 SARIMA POR COMPAÑÍA ===
-st.header("🏢 SARIMA por COMPAÑÍA (Agosto-Diciembre 2025)")
+# === 🎯 SARIMA POR COMPAÑÍA × HOMOLOGACIÓN ===
+st.header("🏢 SARIMA por COMPAÑÍA (con Totales)")
 target_compania = st.radio("Predecir por Compañía", ["Primas", "Siniestros"], horizontal=True, key="compania_target")
 
-if st.button("🚀 Generar SARIMA Compañía", type="secondary", use_container_width=True):
-    with st.spinner("Entrenando SARIMA por Compañía..."):
-        st.session_state.pred_compania = calcular_sarima_compania(df_filt, target_compania)
-        st.success("✅ SARIMA Compañía listo!")
+if st.button("🚀 Generar SARIMA Compañía Completo", type="secondary", use_container_width=True):
+    with st.spinner("Entrenando SARIMA por Compañía × Homologación..."):
+        st.session_state.pred_compania = calcular_sarima_compania_completo(df_filt, target_compania)
+        st.success("✅ SARIMA Compañía Completo listo!")
 
 if 'pred_compania' in st.session_state:
-    pivot_compania = st.session_state.pred_compania.pivot(
+    # Tabla pivot por COMPAÑÍA (incluye TOTAL)
+    pivot_compania = st.session_state.pred_compania.pivot_table(
         index='COMPAÑÍA', 
         columns='Mes_Nombre', 
-        values='Predicción'
+        values='Predicción',
+        aggfunc='sum'  # Suma si hay múltiples homologaciones por compañía
     ).fillna(0).round(0)
     st.dataframe(pivot_compania, use_container_width=True)
 
