@@ -3,7 +3,7 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 from statsmodels.tsa.statespace.sarimax import SARIMAX
-from statsmodels.tsa.arima.model import ARIMA
+from statsmodels.tssa.arima.model import ARIMA
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -96,6 +96,14 @@ if df.empty:
 
 df_clean = preparar_datos(df)
 
+# === FILTRO GLOBAL DE CIUDAD (Sidebar) ===
+st.sidebar.header("🔍 Filtro Ciudad")
+ciudad_opts = sorted(df_clean['CIUDAD'].dropna().unique())
+ciudad = st.sidebar.multiselect("Seleccionar Ciudad", ciudad_opts, default=ciudad_opts)
+
+if ciudad:
+    df_clean = df_clean[df_clean['CIUDAD'].isin(ciudad)]
+
 # === TABS ===
 tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
     "📊 SARIMA Homologación", "🚗 AUTOMÓVILES", "✅ CUMPLIMIENTO", 
@@ -105,6 +113,8 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
 # === TAB 1: SARIMA por HOMOLOGACIÓN ===
 with tab1:
     st.header("🔮 SARIMA por HOMOLOGACIÓN")
+    st.info(f"📊 Datos filtrados: {len(df_clean):,} filas")
+    
     target = st.radio("Predecir", ["Primas", "Siniestros"], horizontal=True, key="homologacion")
     
     if st.button("🚀 Generar SARIMA Homologación", type="primary", use_container_width=True, key="btn_homologacion"):
@@ -278,3 +288,4 @@ with tab8:
             values='Predicción'
         ).fillna(0).round(0)
         st.dataframe(pivot_nosde, use_container_width=True)
+
