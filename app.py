@@ -43,7 +43,6 @@ def preparar_datos(df):
     return df.dropna(subset=['YEAR', 'MONTH'])
 
 def sarima_por_grupo(df_filt, grupo_col, grupo_valor, target_col, steps=5):
-    """SARIMA genérico por cualquier columna de grupo"""
     mask = df_filt[grupo_col] == grupo_valor
     if mask.sum() < 12:
         return np.full(steps, df_filt.loc[mask, target_col].mean())
@@ -75,7 +74,6 @@ def calcular_sarima_homologacion(df_filt, target, steps=5):
     return pd.DataFrame(resultados)
 
 def calcular_sarima_compania(df_filt, target_col='Primas', steps=5):
-    """SARIMA por COMPAÑÍA (para página específica de homologación)"""
     resultados = []
     companias = df_filt['COMPAÑÍA'].unique()
     
@@ -90,21 +88,6 @@ def calcular_sarima_compania(df_filt, target_col='Primas', steps=5):
             })
     
     return pd.DataFrame(resultados)
-
-def calcular_promedio_mensual(df):
-    mensual = df.groupby(['HOMOLOGACIÓN', 'YEAR', 'MONTH']).agg({
-        'Primas': 'sum', 'Siniestros': 'sum'
-    }).round(0)
-    
-    promedio_mensual = mensual.groupby(['HOMOLOGACIÓN', 'MONTH']).mean().round(0)
-    promedio_mensual.columns = ['Promedio_Total_Primas', 'Promedio_Total_Siniestros']
-    promedio_mensual = promedio_mensual.reset_index()
-    
-    mes_map = {1: 'Enero', 2: 'Febrero', 3: 'Marzo', 4: 'Abril', 5: 'Mayo', 6: 'Junio',
-               7: 'Julio', 8: 'Agosto', 9: 'Septiembre', 10: 'Octubre', 11: 'Noviembre', 12: 'Diciembre'}
-    promedio_mensual['Mes_Nombre'] = promedio_mensual['MONTH'].map(mes_map)
-    
-    return promedio_mensual.sort_values(['HOMOLOGACIÓN', 'MONTH'])
 
 # === CARGAR DATOS ===
 df = cargar_datos()
@@ -124,176 +107,5 @@ with tab1:
     st.header("🔮 SARIMA por HOMOLOGACIÓN")
     target = st.radio("Predecir", ["Primas", "Siniestros"], horizontal=True, key="homologacion")
     
-    if st.button("🚀 Generar SARIMA Homologación", type="primary", use_container_width=True, key="btn1"):
-        with st.spinner("Entrenando SARIMA..."):
-            st.session_state.pred_sarima = calcular_sarima_homologacion(df_clean, target)
-            st.session_state.target = target
-            st.success("✅ SARIMA Homologación listo!")
-
-    if 'pred_sarima' in st.session_state:
-        st.subheader("📈 Predicciones Agosto-Diciembre 2025")
-        pivot_sarima = st.session_state.pred_sarima.pivot(
-            index='HOMOLOGACIÓN', 
-            columns='Mes_Nombre', 
-            values='Predicción'
-        ).fillna(0).round(0)
-        st.dataframe(pivot_sarima, use_container_width=True)
-
-    # Gráfico
-    if 'pred_sarima' in st.session_state:
-        fig = px.line(
-            st.session_state.pred_sarima, 
-            x='Mes_Nombre', 
-            y='Predicción',
-            color='HOMOLOGACIÓN',
-            title="SARIMA Predicciones Homologación 2025",
-            markers=True
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-# === TAB 2: AUTOMÓVILES ===
-with tab2:
-    df_auto = df_clean[df_clean['HOMOLOGACIÓN'] == 'AUTOMOVILES']
-    st.header("🚗 SARIMA por COMPAÑÍA - AUTOMÓVILES")
-    st.info(f"📊 Datos: {len(df_auto):,} filas")
-    
-    target_auto = st.radio("Predecir", ["Primas", "Siniestros"], horizontal=True, key="auto")
-    
-    if st.button("🚀 Generar SARIMA AUTOMÓVILES", type="primary", use_container_width=True, key="btn2"):
-        with st.spinner("Entrenando SARIMA AUTOMÓVILES..."):
-            st.session_state.pred_auto = calcular_sarima_compania(df_auto, target_auto)
-            st.success("✅ SARIMA AUTOMÓVILES listo!")
-    
-    if 'pred_auto' in st.session_state:
-        pivot_auto = st.session_state.pred_auto.pivot(
-            index='COMPAÑÍA', 
-            columns='Mes_Nombre', 
-            values='Predicción'
-        ).fillna(0).round(0)
-        st.dataframe(pivot_auto, use_container_width=True)
-
-# === TAB 3: CUMPLIMIENTO ===
-with tab3:
-    df_cumpl = df_clean[df_clean['HOMOLOGACIÓN'] == 'CUMPLIMIENTO']
-    st.header("✅ SARIMA por COMPAÑÍA - CUMPLIMIENTO")
-    st.info(f"📊 Datos: {len(df_cumpl):,} filas")
-    
-    target_cumpl = st.radio("Predecir", ["Primas", "Siniestros"], horizontal=True, key="cumpl")
-    
-    if st.button("🚀 Generar SARIMA CUMPLIMIENTO", type="primary", use_container_width=True, keys="btn3"):
-        with st.spinner("Entrenando SARIMA CUMPLIMIENTO..."):
-            st.session_state.pred_cumpl = calcular_sarima_compania(df_cumpl, target_cumpl)
-            st.success("✅ SARIMA CUMPLIMIENTO listo!")
-    
-    if 'pred_cumpl' in st.session_state:
-        pivot_cumpl = st.session_state.pred_cumpl.pivot(
-            index='COMPAÑÍA', 
-            columns='Mes_Nombre', 
-            values='Predicción'
-        ).fillna(0).round(0)
-        st.dataframe(pivot_cumpl, use_container_width=True)
-
-# === TAB 4: GENERALES ===
-with tab4:
-    df_gen = df_clean[df_clean['HOMOLOGACIÓN'] == 'GENERALES']
-    st.header("🏢 SARIMA por COMPAÑÍA - GENERALES")
-    st.info(f"📊 Datos: {len(df_gen):,} filas")
-    
-    target_gen = st.radio("Predecir", ["Primas", "Siniestros"], horizontal=True, key="gen")
-    
-    if st.button("🚀 Generar SARIMA GENERALES", type="primary", use_container_width=True, key="btn4"):
-        with st.spinner("Entrenando SARIMA GENERALES..."):
-            st.session_state.pred_gen = calcular_sarima_compania(df_gen, target_gen)
-            st.success("✅ SARIMA GENERALES listo!")
-    
-    if 'pred_gen' in st.session_state:
-        pivot_gen = st.session_state.pred_gen.pivot(
-            index='COMPAÑÍA', 
-            columns='Mes_Nombre', 
-            values='Predicción'
-        ).fillna(0).round(0)
-        st.dataframe(pivot_gen, use_container_width=True)
-
-# === TAB 5: RC ===
-with tab5:
-    df_rc = df_clean[df_clean['HOMOLOGACIÓN'] == 'RC']
-    st.header("⚠️ SARIMA por COMPAÑÍA - RC")
-    st.info(f"📊 Datos: {len(df_rc):,} filas")
-    
-    target_rc = st.radio("Predecir", ["Primas", "Siniestros"], horizontal=True, key="rc")
-    
-    if st.button("🚀 Generar SARIMA RC", type="primary", use_container_width=True, key="btn5"):
-        with st.spinner("Entrenando SARIMA RC..."):
-            st.session_state.pred_rc = calcular_sarima_compania(df_rc, target_rc)
-            st.success("✅ SARIMA RC listo!")
-    
-    if 'pred_rc' in st.session_state:
-        pivot_rc = st.session_state.pred_rc.pivot(
-            index='COMPAÑÍA', 
-            columns='Mes_Nombre', 
-            values='Predicción'
-        ).fillna(0).round(0)
-        st.dataframe(pivot_rc, use_container_width=True)
-
-# === TAB 6: SOAT ===
-with tab6:
-    df_soat = df_clean[df_clean['HOMOLOGACIÓN'] == 'SOAT']
-    st.header("🚑 SARIMA por COMPAÑÍA - SOAT")
-    st.info(f"📊 Datos: {len(df_soat):,} filas")
-    
-    target_soat = st.radio("Predecir", ["Primas", "Siniestros"], horizontal=True, key="soat")
-    
-    if st.button("🚀 Generar SARIMA SOAT", type="primary", use_container_width=True, key="btn6"):
-        with st.spinner("Entrenando SARIMA SOAT..."):
-            st.session_state.pred_soat = calcular_sarima_compania(df_soat, target_soat)
-            st.success("✅ SARIMA SOAT listo!")
-    
-    if 'pred_soat' in st.session_state:
-        pivot_soat = st.session_state.pred_soat.pivot(
-            index='COMPAÑÍA', 
-            columns='Mes_Nombre', 
-            values='Predicción'
-        ).fillna(0).round(0)
-        st.dataframe(pivot_soat, use_container_width=True)
-
-# === TAB 7: VIDA ===
-with tab7:
-    df_vida = df_clean[df_clean['HOMOLOGACIÓN'] == 'VIDA']
-    st.header("💚 SARIMA por COMPAÑÍA - VIDA")
-    st.info(f"📊 Datos: {len(df_vida):,} filas")
-    
-    target_vida = st.radio("Predecir", ["Primas", "Siniestros"], horizontal=True, key="vida")
-    
-    if st.button("🚀 Generar SARIMA VIDA", type="primary", use_container_width=True, key="btn7"):
-        with st.spinner("Entrenando SARIMA VIDA..."):
-            st.session_state.pred_vida = calcular_sarima_compania(df_vida, target_vida)
-            st.success("✅ SARIMA VIDA listo!")
-    
-    if 'pred_vida' in st.session_state:
-        pivot_vida = st.session_state.pred_vida.pivot(
-            index='COMPAÑÍA', 
-            columns='Mes_Nombre', 
-            values='Predicción'
-        ).fillna(0).round(0)
-        st.dataframe(pivot_vida, use_container_width=True)
-
-# === TAB 8: NO SDE ===
-with tab8:
-    df_nosde = df_clean[df_clean['HOMOLOGACIÓN'] == 'NO SDE']
-    st.header("❌ SARIMA por COMPAÑÍA - NO SDE")
-    st.info(f"📊 Datos: {len(df_nosde):,} filas")
-    
-    target_nosde = st.radio("Predecir", ["Primas", "Siniestros"], horizontal=True, key="nosde")
-    
-    if st.button("🚀 Generar SARIMA NO SDE", type="primary", use_container_width=True, key="btn8"):
-        with st.spinner("Entrenando SARIMA NO SDE..."):
-            st.session_state.pred_nosde = calcular_sarima_compania(df_nosde, target_nosde)
-            st.success("✅ SARIMA NO SDE listo!")
-    
-    if 'pred_nosde' in st.session_state:
-        pivot_nosde = st.session_state.pred_nosde.pivot(
-            index='COMPAÑÍA', 
-            columns='Mes_Nombre', 
-            values='Predicción'
-        ).fillna(0).round(0)
-        st.dataframe(pivot_nosde, use_container_width=True)
+    if st.button("🚀 Generar SARIMA Homologación", type="primary", use_container_width=True, key="btn_homologacion"):
+        with st.spinner("Entrenando
