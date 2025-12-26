@@ -178,13 +178,18 @@ with tab3:
     
     if 'pred_cumpl' in st.session_state:
         pivot_cumpl = st.session_state.pred_cumpl.pivot(
-            import streamlit as st
-import pandas as pd
-import numpy as np
-import plotly.express as px
-from statsmodels.tsa.statespace.sarimax import SARIMAX
-from statsmodels.tsa.arima.model import ARIMA
-import warnings
-warnings.filterwarnings('ignore')
+            index='COMPAÑÍA', 
+            columns='Mes_Nombre', 
+            values='Predicción'
+        ).fillna(0).round(0)
+        st.dataframe(pivot_cumpl, use_container_width=True)
 
-st.set_page_config(page_title="SARIMA Predicción
+# === TAB 4: GENERALES ===
+with tab4:
+    df_gen = df_clean[df_clean['HOMOLOGACIÓN'] == 'GENERALES']
+    st.header("🏢 SARIMA por COMPAÑÍA - GENERALES")
+    st.info(f"📊 Datos: {len(df_gen):,} filas")
+    
+    target_gen = st.radio("Predecir", ["Primas", "Siniestros"], horizontal=True, key="gen")
+    
+    if st.button("
